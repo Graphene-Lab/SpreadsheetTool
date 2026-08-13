@@ -19,7 +19,7 @@ jobs:
         shell: bash
         run: |
           for i in 1 2 3 4 5 6; do
-            dotnet pack SpreadsheetTool.csproj -c Release -o ./out -p:SkipNuGetPush=true && break
+            dotnet pack SpreadsheetTool.csproj -c Release -o ./out -p:SkipNuGetPush=true -p:RestoreForce=true && break
             echo "retry $i (waiting for dependency packages on nuget.org)..."
             sleep 60
           done
