@@ -1,0 +1,86 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <OutputType>Library</OutputType>
+    <LangVersion>latest</LangVersion>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <GenerateDocumentationFile>True</GenerateDocumentationFile>
+    <!-- Plugin binaries must be OS-neutral: AnyCPU and NO RuntimeIdentifier. The MSBuild
+         target that ships this plugin into the host's Tools/ folder forces
+         RuntimeIdentifier= empty (see AIOffice.csproj, BuildToolPlugins). -->
+    <PlatformTarget>AnyCPU</PlatformTarget>
+    <Papyrine_SponsorshipLicenseIgnored>true</Papyrine_SponsorshipLicenseIgnored>
+    <Configurations>Debug;Release;Test</Configurations>
+    <PackageId>Graphene.SpreadsheetTool</PackageId>
+    <Version>$([System.DateTime]::Now.ToString("1.yy.MM.dd"))</Version>
+    <Description>Spreadsheet (XLSX) agent tool for AIOrchestrator: open/create, cells, ranges, styles, charts, tables.</Description>
+    <PackageReadmeFile>README.md</PackageReadmeFile>
+    <PackageLicenseFile>LICENSE.md</PackageLicenseFile>
+    <PackageRequireLicenseAcceptance>False</PackageRequireLicenseAcceptance>
+    <Copyright>Andrea Bruno</Copyright>
+    <RepositoryUrl>https://github.com/Graphene-Lab/SpreadsheetTool</RepositoryUrl>
+    <PackageTags>agent;tool;spreadsheet;xlsx;llm;automation</PackageTags>
+  </PropertyGroup>
+
+  <!-- Dual-reference pattern (as in AIOrchestrator): the local sibling project wins when
+       present (solution builds); otherwise the NuGet package (1.* floating = always latest)
+       is restored — required for CI/standalone builds where the sibling sources are absent. -->
+  <ItemGroup>
+    <ProjectReference Include="..\AIOrchestrator\AIOrchestrator.csproj" Condition="Exists('..\AIOrchestrator\AIOrchestrator.csproj')" />
+  </ItemGroup>
+  <ItemGroup>
+    <PackageReference Include="Graphene.AIOrchestrator" Version="1.*" />
+  </ItemGroup>
+
+  <!-- Nested test project (SpreadsheetTool.Tests) must NOT be compiled into this library:
+       the SDK default **/*.cs glob would otherwise include its sources, polluting the
+       plugin assembly. -->
+  <ItemGroup>
+    <Compile Remove="SpreadsheetTool.Tests\**\*.cs" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <None Update="LICENSE.md">
+      <Pack>True</Pack>
+      <PackagePath>\</PackagePath>
+    </None>
+    <None Update="README.md">
+      <Pack>True</Pack>
+      <PackagePath>\</PackagePath>
+    </None>
+  </ItemGroup>
+
+  <!-- Date-based auto version + NuGet publishing, same mechanism as AIOrchestrator.
+       Local/VS: dotnet pack publishes with the NuGetApiKey env var; CI: publish.yml on master. -->
+  <Target Name="SetPackageVersion" DependsOnTargets="Build">
+    <PropertyGroup>
+      <PackageVersion>$(Version)</PackageVersion>
+    </PropertyGroup>
+  </Target>
+
+  <PropertyGroup>
+    <NuGetSource Condition="'$(NuGetSource)' == ''">https://api.nuget.org/v3/index.json</NuGetSource>
+  </PropertyGroup>
+
+  <Target Name="CleanOldNuGetPackages" BeforeTargets="GenerateNuspec">
+    <CreateItem Include="$(PackageOutputPath)*.nupkg">
+      <Output TaskParameter="Include" ItemName="_OldNupkg" />
+    </CreateItem>
+    <Delete Files="@(_OldNupkg)" />
+  </Target>
+
+  <Target Name="PublishPackageToNuGet" AfterTargets="Pack" Condition="'$(SkipNuGetPush)' != 'true'">
+    <Error Condition="'$(NuGetApiKey)' == ''"
+           Text="NuGetApiKey env var not set: run `setx NuGetApiKey &lt;key&gt;` and restart Visual Studio." />
+    <CreateItem Include="$(PackageOutputPath)*.nupkg">
+      <Output TaskParameter="Include" ItemName="_NuGetPackageToPush" />
+    </CreateItem>
+    <Error Condition="'@(_NuGetPackageToPush)' == ''"
+           Text="No package found in $(PackageOutputPath): pack produced no expected file." />
+    <Message Importance="High" Text="Publishing %(_NuGetPackageToPush.Identity) to $(NuGetSource) ..." />
+    <Exec Command="dotnet nuget push &quot;%(_NuGetPackageToPush.Identity)&quot; --api-key &quot;$(NuGetApiKey)&quot; --source &quot;$(NuGetSource)&quot; --skip-duplicate" />
+  </Target>
+
+</Project>
