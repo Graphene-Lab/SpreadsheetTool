@@ -8,7 +8,7 @@ namespace AIOrchestrator.API
     /// <summary>
     /// Spreadsheet (XLSX) operations for agent use: open/create, cells, ranges, styles, charts, tables.
     /// </summary>
-    public class SpreadsheetTool : IDisposable, IAgentTool, IFileTool
+    public class SpreadsheetTool : BaseAgentTool, IDisposable, IFileTool
     {
         private Workbook? _workbook;
         private string _filePath = string.Empty;
