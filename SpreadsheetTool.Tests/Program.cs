@@ -108,7 +108,7 @@ static class Program
             Console.WriteLine("Starting agent scenario — building the Aurora Coffee workbook…");
             var task = Task.Run(() => orch.ExecuteAction(
                 AuroraPrompt,
-                new[] { typeof(SpreadsheetTool) },
+                new[] { "SpreadsheetTool" },
                 maxIterations: 80));
             done.Wait(TimeSpan.FromSeconds(30)); // guard only — GetResult waits for completion
             var result = task.GetAwaiter().GetResult();
