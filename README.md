@@ -19,7 +19,7 @@ reflection pipeline.
 - **Host with static reference**: `ProjectReference` the project (or
   `PackageReference Graphene.SpreadsheetTool`) and register
   `typeof(AIOrchestrator.API.SpreadsheetTool)` in the agent types array passed to
-  `AgentOrchestrator.ExecuteAction`.
+  `AgentHarness.ExecuteAction`.
 
 ## Build
 

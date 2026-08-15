@@ -24,6 +24,13 @@
     <PackageTags>agent;tool;spreadsheet;xlsx;llm;automation</PackageTags>
   </PropertyGroup>
 
+  <!-- Runtime plugin identity: AIOrchestrator.PluginUpdater reads these assembly metadata
+       attributes to know which NuGet package and version a loaded plugin comes from. -->
+  <ItemGroup>
+    <AssemblyMetadata Include="NuGetPackageId" Value="Graphene.SpreadsheetTool" />
+    <AssemblyMetadata Include="NuGetPackageVersion" Value="$(Version)" />
+  </ItemGroup>
+
   <!-- Dual-reference pattern (as in AIOrchestrator): the local sibling project wins when
        present (solution builds); otherwise the NuGet package (1.* floating = always latest)
        is restored — required for CI/standalone builds where the sibling sources are absent. -->
