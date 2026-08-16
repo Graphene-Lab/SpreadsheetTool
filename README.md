@@ -5,7 +5,7 @@ tables. Implements `AIOrchestrator.API.IAgentTool`.
 
 ## What it is
 
-A **plugin** for hosts built on [Graphene.AIOrchestrator](https://github.com/Graphene-Lab/AIOrchestrator)
+A **plugin** for hosts built on [Graphene.AIOrchestrator](https://github.com/Graphene-Lab/AgentHarness)
 (e.g. AIOffice): the assembly is loaded dynamically from the host's `Tools/` folder
 at startup (or hot-added via a filesystem watcher) and its public methods become
 LLM-callable tools through the `UISupportGeneric.Analyzer.GeToolDefinitions`
