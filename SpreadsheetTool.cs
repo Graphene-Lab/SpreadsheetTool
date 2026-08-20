@@ -95,27 +95,26 @@ namespace AIOrchestrator.API
         /// Writes all pending changes to the current file path — an explicit checkpoint.
         /// (Changes are also persisted automatically when the tool is disposed, so the file
         /// on disk always reflects the final session state.)
-        /// Before saving, creates a numbered backup of the existing file (.001.bak, .002.bak, ...)
-        /// so the original state can be restored later via <see cref="Restore"/>.
+        /// The new content becomes a new version in the workspace git repo (rollback via GitTool.restore).
         /// </summary>
-        /// <returns>A message describing the result: the backup file name, or "No changes to save" if nothing loaded.</returns>
+        /// <returns>A message describing the result: the new version id, or "No changes to save" if nothing loaded.</returns>
         public string Save()
         {
             if (_workbook == null) return "No changes to save — no workbook is open.";
 
-            var backupName = CreateBackup(_filePath);
             _workbook.Save(_filePath);
             PatchChartCaches(_filePath);
-            Log.LogStep($"SpreadsheetTool.Save: saved to '{_filePath}', backup='{backupName}'");
-            return string.IsNullOrEmpty(backupName)
-                ? $"Workbook saved to '{Path.GetFileName(_filePath)}'. (New file, no backup needed.)"
-                : $"Workbook saved to '{Path.GetFileName(_filePath)}'. The previous version was backed up as '{backupName}'.";
+            var versionId = GitSupport.Snapshot(_filePath, "SpreadsheetTool save");
+            Log.LogStep($"SpreadsheetTool.Save: saved to '{_filePath}', version='{versionId}'");
+            return versionId != null
+                ? $"Workbook saved to '{Path.GetFileName(_filePath)}'. New version: {versionId}. (Rollback via GitTool.restore.)"
+                : $"Workbook saved to '{Path.GetFileName(_filePath)}'. (No changes detected.)";
         }
 
         /// <summary>
         /// Writes all pending changes to a new file path.
         /// Subsequent Save() calls will use the new path.
-        /// If the target file already exists, a numbered backup is created first.
+        /// The new content becomes a new version in the workspace git repo.
         /// </summary>
         /// <param name="newFilePath">Path for the new .xlsx file, Unix style relative to the workspace root (e.g. "/folder/file.xlsx").</param>
         /// <returns>A message describing the result.</returns>
@@ -124,86 +123,36 @@ namespace AIOrchestrator.API
             if (_workbook == null) return "No changes to save — no workbook is open.";
 
             var resolved = SandboxPath.Resolve(newFilePath);
-            var backupName = File.Exists(resolved) ? CreateBackup(resolved) : null;
             _workbook.Save(resolved);
             PatchChartCaches(resolved);
-            var oldPath = Path.GetFileName(_filePath);
             _filePath = resolved;
-            Log.LogStep($"SpreadsheetTool.SaveAs: saved to '{_filePath}'");
-            return backupName != null
-                ? $"Workbook saved as '{Path.GetFileName(resolved)}'. The existing file at that path was backed up as '{backupName}'."
+            var versionId = GitSupport.Snapshot(_filePath, "SpreadsheetTool save as");
+            Log.LogStep($"SpreadsheetTool.SaveAs: saved to '{_filePath}', version='{versionId}'");
+            return versionId != null
+                ? $"Workbook saved as '{Path.GetFileName(resolved)}'. New version: {versionId}."
                 : $"Workbook saved as '{Path.GetFileName(resolved)}'.";
         }
 
-        /// <summary>
-        /// Creates a numbered backup of the specified file.
-        /// Backup files follow the pattern: filename.NNN.bak (e.g. "data.001.bak", "data.002.bak").
-        /// Never overwrites existing backups.
-        /// </summary>
-        /// <returns>The backup file name (without directory), or null if no file existed to back up.</returns>
-        private static string? CreateBackup(string filePath)
-        {
-            if (!File.Exists(filePath)) return null;
-
-            var dir = Path.GetDirectoryName(filePath) ?? ".";
-            var nameWithoutExt = Path.GetFileNameWithoutExtension(filePath);
-
-            // Find the next available backup number
-            for (int i = 1; i <= 9999; i++)
-            {
-                var backupName = $"{nameWithoutExt}.{i:D3}.bak";
-                var backupPath = Path.Combine(dir, backupName);
-                if (!File.Exists(backupPath))
-                {
-                    File.Copy(filePath, backupPath);
-                    return backupName;
-                }
-            }
-
-            // Fallback: extremely unlikely, use timestamp
-            var ts = DateTime.Now.ToString("yyyyMMddHHmmss");
-            var fallbackName = $"{nameWithoutExt}.{ts}.bak";
-            File.Copy(filePath, Path.Combine(dir, fallbackName));
-            return fallbackName;
-        }
-
-        /// <summary>
-        /// Restores the workbook to its state from the most recent backup (.bak file).
-        /// The backup with the highest number is restored (most recent save point).
-        /// The current (modified) workbook is replaced with the backup copy, and the
-        /// backup file is preserved (not deleted) for future rollbacks.
-        /// </summary>
-        /// <returns>A message describing the restore result.</returns>
-        public string Restore()
+        /// <summary>Reverts the OPEN workbook to a version from the workspace git repo (list them with
+        /// GitTool.history). The current state is saved as a new version first (the rollback is
+        /// reversible), then the file is overwritten and the workbook is reloaded. Use this when the
+        /// workbook is open in this tool; GitTool.restore handles files that are not open.</summary>
+        /// <param name="versionId">Version to restore, from GitTool.history().</param>
+        /// <returns>Descriptive result message.</returns>
+        public string Restore(string versionId)
         {
             if (_workbook == null) return "No workbook is open. Nothing to restore.";
-
-            var dir = Path.GetDirectoryName(_filePath) ?? ".";
-            var nameWithoutExt = Path.GetFileNameWithoutExtension(_filePath);
-
-            // Find the most recent backup (highest number)
-            var backupFiles = Directory.GetFiles(dir, $"{nameWithoutExt}.*.bak")
-                .OrderByDescending(f => f)
-                .ToList();
-
-            if (backupFiles.Count == 0)
-                return "No backup file found. The workbook was never saved with backup enabled.";
-
-            var latestBackup = backupFiles[0];
-            var backupName = Path.GetFileName(latestBackup);
-
             try
             {
-                _workbook.Dispose();
-                File.Copy(latestBackup, _filePath, overwrite: true);
+                _workbook.Dispose();   // release the open handle so the file can be overwritten
+                var message = GitSupport.Restore(versionId, _filePath);
                 _workbook = new Workbook(_filePath);
-                Log.LogStep($"SpreadsheetTool.Restore: restored '{_filePath}' from '{backupName}'");
-                return $"Workbook restored from backup '{backupName}'. The backup file has been preserved.";
+                return message;
             }
             catch (Exception ex)
             {
-                Log.LogStep($"SpreadsheetTool.Restore: FAILED — {ex.Message}");
-                return $"Restore failed: {ex.Message}";
+                try { if (_workbook == null) _workbook = new Workbook(_filePath); } catch { }
+                return $"Error: Restore failed: {ex.Message}";
             }
         }
 
@@ -218,12 +167,12 @@ namespace AIOrchestrator.API
             {
                 if (_workbook != null && !string.IsNullOrEmpty(_filePath))
                 {
-                    var backupName = CreateBackup(_filePath);
                     _workbook.Save(_filePath);
                     PatchChartCaches(_filePath);
-                    Log.LogStep(string.IsNullOrEmpty(backupName)
-                        ? $"SpreadsheetTool.Dispose: auto-saved '{_filePath}' (new file, no backup)"
-                        : $"SpreadsheetTool.Dispose: auto-saved '{_filePath}' (backup '{backupName}')");
+                    var versionId = GitSupport.Snapshot(_filePath, "SpreadsheetTool auto-save");
+                    Log.LogStep(versionId != null
+                        ? $"SpreadsheetTool.Dispose: auto-saved '{_filePath}' (version '{versionId}')"
+                        : $"SpreadsheetTool.Dispose: auto-saved '{_filePath}' (no changes)");
                 }
             }
             catch (Exception ex)
