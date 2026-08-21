@@ -20,7 +20,7 @@ static class Program
     static int Main(string[] args)
     {
         // Method surface diagnostic: verifies which methods the LLM actually sees in the
-        // generated tool definitions (GeToolDefinitions output) — no LLM involved.
+        // generated tool definitions (GetToolDefinitions output) — no LLM involved.
         if (args.Contains("--methods"))
             return RunMethodsDiag();
 
@@ -87,7 +87,7 @@ static class Program
         Setup.SkipIndexingOnStartup = true;
         Setup.DocumentsPath = workspace;
 
-        var orch = new AgentOrchestrator(providerName);
+        var orch = new AgentHarness(providerName);
         try
         {
             using var done = new ManualResetEventSlim();
@@ -95,13 +95,13 @@ static class Program
             {
                 var line = e.State switch
                 {
-                    AgentOrchestrator.AgentState.Iteration => $"[{e.TotalElapsedMs / 1000,4}s] iter {e.Iteration,2} → {e.MethodName}",
-                    AgentOrchestrator.AgentState.Completed => $"[{e.TotalElapsedMs / 1000,4}s] COMPLETED after {e.Iteration} iterations",
-                    AgentOrchestrator.AgentState.Failed => $"[{e.TotalElapsedMs / 1000,4}s] FAILED: {e.Error}",
+                    AgentHarness.AgentState.Iteration => $"[{e.TotalElapsedMs / 1000,4}s] iter {e.Iteration,2} → {e.MethodName}",
+                    AgentHarness.AgentState.Completed => $"[{e.TotalElapsedMs / 1000,4}s] COMPLETED after {e.Iteration} iterations",
+                    AgentHarness.AgentState.Failed => $"[{e.TotalElapsedMs / 1000,4}s] FAILED: {e.Error}",
                     _ => $"[{e.TotalElapsedMs / 1000,4}s] {e.State}"
                 };
                 Console.WriteLine(line);
-                if (e.State is AgentOrchestrator.AgentState.Completed or AgentOrchestrator.AgentState.Failed)
+                if (e.State is AgentHarness.AgentState.Completed or AgentHarness.AgentState.Failed)
                     done.Set();
             };
 
@@ -315,7 +315,7 @@ static class Program
         return ok ? 0 : 1;
     }
 
-    /// <summary>Verifies the method surface the LLM is given: GeToolDefinitions must
+    /// <summary>Verifies the method surface the LLM is given: GetToolDefinitions must
     /// contain every method the scenario relies on. No LLM involved — this proves whether
     /// an agent's "method X doesn't exist" claim is a tool gap or a model hallucination.</summary>
     static int RunMethodsDiag()
@@ -325,7 +325,7 @@ static class Program
         Console.WriteLine("╚══════════════════════════════════════════════════╝");
         Log.IsEnabled = true;
 
-        var defs = UISupportGeneric.Analyzer.GeToolDefinitions(typeof(SpreadsheetTool));
+        var defs = UISupportGeneric.Analyzer.GetToolDefinitions(typeof(SpreadsheetTool));
         var required = new[]
         {
             "create", "save", "save_as", "get_sheet_names", "rename_worksheet", "add_worksheet",
