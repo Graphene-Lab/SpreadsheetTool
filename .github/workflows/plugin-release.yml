@@ -5,13 +5,17 @@
 #  .github/workflows/plugin-release.yml and push a tag v* (date version,
 #  e.g. v1.26.08.25) to publish. No per-plugin modifications needed.
 #
-#  What it does: builds the plugin with its FULL runtime closure
-#  (CopyLocalLockFileAssemblies), removes the AIOrchestrator dependency graph
-#  (the host provides it — shipping copies would shadow the host's assemblies),
-#  and creates a GitHub Release with a self-contained zip. Hosts (AgentBridge,
-#  AIOffice) install/update plugins from this zip into Tools/<Plugin>/.
+#  What it does:
+#    - builds the plugin with the full runtime closure, then packs its nupkg;
+#    - the payload comes from the PLUGIN'S OWN nupkg lib/<tfm>/ (dll + xml + the
+#      plugin's own assets — nothing else, so no AIOrchestrator content junk);
+#    - plus the plugin's UNIQUE dependency dlls (closure minus the AIOrchestrator
+#      graph, computed mechanically from project.assets.json — the host provides
+#      that graph, and shipping copies would shadow the host's assemblies);
+#    - creates a GitHub Release with the self-contained <Tool>-<version>.zip.
 #
-#  The repo MUST be PUBLIC: hosts download the zip anonymously, with no token.
+#  Hosts (AgentBridge, AIOffice) install/update plugins from this zip into
+#  Tools/<Plugin>/. The repo MUST be PUBLIC: hosts download anonymously.
 #
 #  NuGet publication (third-party library consumers) stays in the SEPARATE
 #  publish.yml — the plugin deployment/update logic never touches NuGet.
@@ -87,16 +91,35 @@ jobs:
       - name: Stage the self-contained plugin folder
         shell: bash
         run: |
+          # The payload = the PLUGIN'S OWN nupkg lib/<tfm>/ (dll + xml + own assets,
+          # nothing else) + the plugin's unique dependency dlls (closure minus the
+          # host contract). No .playwright/, no runtimes/, no AIOrchestrator content.
           TOOL="${{ steps.info.outputs.tool }}"
+          PROJ="${{ steps.info.outputs.proj }}"
+          for i in 1 2 3 4 5 6; do
+            dotnet pack "$PROJ" -c Release -o ./out -p:SkipNuGetPush=true -p:RestoreForce=true && break
+            echo "retry $i (pack, waiting for dependency packages)..."
+            sleep 60
+          done
+          NUPKG=$(ls ./out/*.nupkg | head -n1)
+          test -n "$NUPKG"
+          rm -rf /tmp/nupkg /tmp/stage && mkdir -p /tmp/nupkg /tmp/stage
+          python3 -m zipfile -e "$NUPKG" /tmp/nupkg
           STAGE="/tmp/stage/$TOOL"
           mkdir -p "$STAGE"
-          cp -r "bin/Release/net10.0/." "$STAGE/"
-          # Remove the host-contract dlls and debug symbols from the payload.
-          while read -r f; do rm -f "$STAGE/$f"; done < host-contract.txt
-          find "$STAGE" -name '*.pdb' -delete
+          cp -r /tmp/nupkg/lib/net10.0/. "$STAGE/"
+          # Unique dependency dlls (the bin closure minus the host contract).
+          for f in bin/Release/net10.0/*.dll; do
+            base=$(basename "$f")
+            grep -qxF "$base" host-contract.txt || cp "$f" "$STAGE/"
+          done
+          echo "--- staged files ---"
+          (cd "$STAGE" && find . -type f | sort)
 
       - name: Zip + GitHub Release
         shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
           TOOL="${{ steps.info.outputs.tool }}"
           VERSION="${{ steps.info.outputs.version }}"
