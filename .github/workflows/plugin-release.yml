@@ -6,12 +6,12 @@
 #  e.g. v1.26.08.25) to publish. No per-plugin modifications needed.
 #
 #  What it does:
-#    - builds the plugin with the full runtime closure, then packs its nupkg;
+#    - builds the plugin, then packs its nupkg;
 #    - the payload comes from the PLUGIN'S OWN nupkg lib/<tfm>/ (dll + xml + the
-#      plugin's own assets — nothing else, so no AIOrchestrator content junk);
-#    - plus the plugin's UNIQUE dependency dlls (closure minus the AIOrchestrator
-#      graph, computed mechanically from project.assets.json — the host provides
-#      that graph, and shipping copies would shadow the host's assemblies);
+#      plugin's own assets — nothing else, so no host content junk);
+#    - plus the plugin's UNIQUE dependency dlls: every package in the restore
+#      graph EXCEPT the AIOrchestrator closure, copied from the NuGet cache
+#      (deterministic — does not rely on what the SDK copied into bin/);
 #    - creates a GitHub Release with the self-contained <Tool>-<version>.zip.
 #
 #  Hosts (AgentBridge, AIOffice) install/update plugins from this zip into
@@ -49,51 +49,55 @@ jobs:
           echo "tool=$(basename "$PROJ" .csproj)" >> "$GITHUB_OUTPUT"
           echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
 
-      - name: Build with the full runtime closure
+      - name: Restore + build (also produces obj/project.assets.json)
         shell: bash
         run: |
           # Retry while the date-versioned dependency packages propagate on nuget.org.
           for i in 1 2 3 4 5 6; do
             dotnet build "${{ steps.info.outputs.proj }}" -c Release \
-              -p:CopyLocalLockFileAssemblies=true -p:RestoreForce=true && break
+              -p:RestoreForce=true && break
             echo "retry $i (waiting for dependency packages on nuget.org)..."
             sleep 60
           done
-          test -d "bin/Release/net10.0"
+          test -f "obj/project.assets.json"
 
-      - name: Compute the AIOrchestrator host contract
+      - name: Compute host contract + unique deps from the restore graph
         shell: bash
         run: |
-          # The host contract = Graphene.AIOrchestrator + its transitive package
-          # graph (the assemblies the host already loads). Walk project.assets.json
-          # and list the runtime dlls to EXCLUDE from the plugin zip.
-          python3 - <<'PY' > host-contract.txt
+          # Host contract = Graphene.AIOrchestrator + its transitive package graph
+          # (the assemblies the host already loads). The plugin zip carries ONLY the
+          # dlls of the packages NOT in that graph — the plugin's unique dependencies.
+          python3 - <<'PY' > unique-deps.txt
           import json, os, collections
           assets = json.load(open("obj/project.assets.json"))
           targets = assets["targets"][next(iter(assets["targets"]))]
-          seen, queue = set(), collections.deque()
+          closed, queue = set(), collections.deque()
           for key in targets:
               if key.startswith("Graphene.AIOrchestrator/"):
                   queue.append(key)
           while queue:
               pkg = queue.popleft()
-              if pkg in seen:
+              if pkg in closed:
                   continue
-              seen.add(pkg)
+              closed.add(pkg)
               for dep, ver in targets.get(pkg, {}).get("dependencies", {}).items():
                   queue.append(dep + "/" + ver)
-          files = sorted({os.path.basename(rel) for pkg in seen
-                          for rel in targets.get(pkg, {}).get("runtime", {})})
-          print("\n".join(files))
+          for key in sorted(targets):
+              if key in closed:
+                  continue
+              for rel in targets.get(key, {}).get("runtime", {}):
+                  dll = os.path.basename(rel)
+                  if dll.lower().endswith(".dll"):
+                      print(key + "\t" + dll)
           PY
-          echo "host contract: $(wc -l < host-contract.txt) dlls excluded"
+          echo "unique dep dlls: $(wc -l < unique-deps.txt)"
+          cat unique-deps.txt
 
       - name: Stage the self-contained plugin folder
         shell: bash
         run: |
-          # The payload = the PLUGIN'S OWN nupkg lib/<tfm>/ (dll + xml + own assets,
-          # nothing else) + the plugin's unique dependency dlls (closure minus the
-          # host contract). No .playwright/, no runtimes/, no AIOrchestrator content.
+          # The payload = the PLUGIN'S OWN nupkg lib/<tfm>/ (dll + xml + own assets)
+          # + the unique dependency dlls (from the NuGet cache, per the graph above).
           TOOL="${{ steps.info.outputs.tool }}"
           PROJ="${{ steps.info.outputs.proj }}"
           for i in 1 2 3 4 5 6; do
@@ -108,11 +112,16 @@ jobs:
           STAGE="/tmp/stage/$TOOL"
           mkdir -p "$STAGE"
           cp -r /tmp/nupkg/lib/net10.0/. "$STAGE/"
-          # Unique dependency dlls (the bin closure minus the host contract).
-          for f in bin/Release/net10.0/*.dll; do
-            base=$(basename "$f")
-            grep -qxF "$base" host-contract.txt || cp "$f" "$STAGE/"
-          done
+          # Unique dependency dlls from the NuGet global cache.
+          while IFS=$'\t' read -r pkg dll; do
+            id="${pkg%%/*}"; ver="${pkg#*/}"
+            src=$(find "$HOME/.nuget/packages/${id,,}/$ver" -name "$dll" -path '*/lib/*' 2>/dev/null | head -n1)
+            if [ -n "$src" ]; then
+              cp "$src" "$STAGE/"
+            else
+              echo "::warning::unique dep not found in cache: $pkg -> $dll"
+            fi
+          done < unique-deps.txt
           echo "--- staged files ---"
           (cd "$STAGE" && find . -type f | sort)
 
