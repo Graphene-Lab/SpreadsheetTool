@@ -1,0 +1,114 @@
+# ═══════════════════════════════════════════════════════════════════════
+#  plugin-release.yml — STANDARD plugin release workflow (Graphene-Lab)
+#
+#  IDENTICAL for every plugin repo: copy this file to
+#  .github/workflows/plugin-release.yml and push a tag v* (date version,
+#  e.g. v1.26.08.25) to publish. No per-plugin modifications needed.
+#
+#  What it does: builds the plugin with its FULL runtime closure
+#  (CopyLocalLockFileAssemblies), removes the AIOrchestrator dependency graph
+#  (the host provides it — shipping copies would shadow the host's assemblies),
+#  and creates a GitHub Release with a self-contained zip. Hosts (AgentBridge,
+#  AIOffice) install/update plugins from this zip into Tools/<Plugin>/.
+#
+#  The repo MUST be PUBLIC: hosts download the zip anonymously, with no token.
+#
+#  NuGet publication (third-party library consumers) stays in the SEPARATE
+#  publish.yml — the plugin deployment/update logic never touches NuGet.
+# ═══════════════════════════════════════════════════════════════════════
+name: Plugin Release
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '10.0.x'
+
+      - name: Resolve plugin project and version
+        id: info
+        shell: bash
+        run: |
+          # The first NON-test .csproj in the repo root is the plugin project.
+          PROJ=$(ls *.csproj | grep -viE 'test' | head -n1)
+          echo "proj=$PROJ" >> "$GITHUB_OUTPUT"
+          echo "tool=$(basename "$PROJ" .csproj)" >> "$GITHUB_OUTPUT"
+          echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+
+      - name: Build with the full runtime closure
+        shell: bash
+        run: |
+          # Retry while the date-versioned dependency packages propagate on nuget.org.
+          for i in 1 2 3 4 5 6; do
+            dotnet build "${{ steps.info.outputs.proj }}" -c Release \
+              -p:CopyLocalLockFileAssemblies=true -p:RestoreForce=true && break
+            echo "retry $i (waiting for dependency packages on nuget.org)..."
+            sleep 60
+          done
+          test -d "bin/Release/net10.0"
+
+      - name: Compute the AIOrchestrator host contract
+        shell: bash
+        run: |
+          # The host contract = Graphene.AIOrchestrator + its transitive package
+          # graph (the assemblies the host already loads). Walk project.assets.json
+          # and list the runtime dlls to EXCLUDE from the plugin zip.
+          python3 - <<'PY' > host-contract.txt
+          import json, os, collections
+          assets = json.load(open("obj/project.assets.json"))
+          targets = assets["targets"][next(iter(assets["targets"]))]
+          seen, queue = set(), collections.deque()
+          for key in targets:
+              if key.startswith("Graphene.AIOrchestrator/"):
+                  queue.append(key)
+          while queue:
+              pkg = queue.popleft()
+              if pkg in seen:
+                  continue
+              seen.add(pkg)
+              for dep, ver in targets.get(pkg, {}).get("dependencies", {}).items():
+                  queue.append(dep + "/" + ver)
+          files = sorted({os.path.basename(rel) for pkg in seen
+                          for rel in targets.get(pkg, {}).get("runtime", {})})
+          print("\n".join(files))
+          PY
+          echo "host contract: $(wc -l < host-contract.txt) dlls excluded"
+
+      - name: Stage the self-contained plugin folder
+        shell: bash
+        run: |
+          TOOL="${{ steps.info.outputs.tool }}"
+          STAGE="/tmp/stage/$TOOL"
+          mkdir -p "$STAGE"
+          cp -r "bin/Release/net10.0/." "$STAGE/"
+          # Remove the host-contract dlls and debug symbols from the payload.
+          while read -r f; do rm -f "$STAGE/$f"; done < host-contract.txt
+          find "$STAGE" -name '*.pdb' -delete
+
+      - name: Zip + GitHub Release
+        shell: bash
+        run: |
+          TOOL="${{ steps.info.outputs.tool }}"
+          VERSION="${{ steps.info.outputs.version }}"
+          ZIP="$TOOL-$VERSION.zip"
+          (cd /tmp/stage && python3 -m zipfile -c "$GITHUB_WORKSPACE/$ZIP" "$TOOL")
+          ls -lh "$ZIP"
+          if gh release view "v$VERSION" >/dev/null 2>&1; then
+            # Same-day re-release: refresh the asset instead of failing on the existing tag.
+            gh release upload "v$VERSION" "$ZIP" --clobber
+            gh release edit "v$VERSION" --notes "Self-contained plugin zip for host deployment (deps minus the AIOrchestrator graph)."
+          else
+            gh release create "v$VERSION" "$ZIP" \
+              --title "v$VERSION" \
+              --notes "Self-contained plugin zip for host deployment (deps minus the AIOrchestrator graph)."
+          fi
