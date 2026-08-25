@@ -13,10 +13,18 @@ namespace AIOrchestrator.API
         private Workbook? _workbook;
         private string _filePath = string.Empty;
 
+        /// <summary>True when the in-memory workbook differs from the file on disk. Lets Dispose
+        /// skip the redundant second save when the agent already called Save explicitly.</summary>
+        private bool _dirty;
+
         /// <summary>Columns whose width was already auto-set in this session, per worksheet.
         /// First use of a fresh column gets an auto width; later edits keep it (deterministic
         /// assist — the agent should not have to estimate column widths).</summary>
         private readonly Dictionary<string, HashSet<int>> _autoWidthCols = new();
+
+        /// <summary>Guard for agent-supplied ranges: the tool must never let a huge range
+        /// (e.g. "A1:XFD1048576") allocate unbounded memory or hang the session.</summary>
+        private const int MaxCellArea = 1_000_000;
 
         /// <summary>
         /// Parameterless constructor for agent activation. Call <see cref="Open"/> or <see cref="Create"/>
@@ -30,9 +38,8 @@ namespace AIOrchestrator.API
         /// Opens an existing XLSX workbook for editing.
         /// </summary>
         /// <param name="filePath">
-        /// Path to an existing .xlsx file (Unix style, e.g. "/folder/file.xlsx"), relative
-        /// to the workspace root (the sandbox). Absolute Windows paths are accepted only
-        /// if they descend from the sandbox root.
+        /// Path to an existing .xlsx file, Unix style relative to the workspace root (leading
+        /// "/", e.g. "/folder/file.xlsx").
         /// </param>
         public SpreadsheetTool(string filePath)
         {
@@ -45,8 +52,8 @@ namespace AIOrchestrator.API
         /// and needs to load a specific file.
         /// </summary>
         /// <param name="filePath">Path to an existing .xlsx file (Unix style, e.g. "/folder/file.xlsx").</param>
-        /// <returns>True if the file was opened successfully.</returns>
-        public bool Open(string filePath)
+        /// <returns>"true", or "Error: …" when the file cannot be opened.</returns>
+        public string Open(string filePath)
         {
             try
             {
@@ -58,13 +65,14 @@ namespace AIOrchestrator.API
                 _autoWidthCols.Clear();
                 foreach (var ws in _workbook.Worksheets)
                     _autoWidthCols[ws.Name] = ScanNonEmptyColumns(ws);
+                _dirty = false;
                 Log.LogStep($"SpreadsheetTool.Open: opened '{_filePath}'");
-                return true;
+                return "true";
             }
             catch (Exception ex)
             {
                 Log.LogStep($"SpreadsheetTool.Open: failed '{filePath}': {ex.Message}");
-                return false;
+                return $"Error: {ex.Message}";
             }
         }
 
@@ -75,36 +83,54 @@ namespace AIOrchestrator.API
         /// discarded the workbook and every later edit failed with a NullReferenceException.
         /// </summary>
         /// <param name="filePath">
-        /// Path where the new .xlsx file will be saved (Unix style, e.g. "/folder/file.xlsx"),
-        /// relative to the sandbox workspace root.
+        /// Path where the new .xlsx file will be saved, Unix style relative to the workspace
+        /// root (e.g. "/folder/file.xlsx").
         /// </param>
-        /// <returns>True when the workbook was created and saved.</returns>
-        public bool Create(string filePath)
+        /// <returns>"true", or "Error: …" when the file cannot be created.</returns>
+        public string Create(string filePath)
         {
-            var resolved = SandboxPath.Resolve(filePath);
-            _workbook?.Dispose();
-            _workbook = new Workbook();
-            _autoWidthCols.Clear();
-            _workbook.Save(resolved);
-            _filePath = resolved;
-            Log.LogStep($"SpreadsheetTool.Create: created '{resolved}'");
-            return true;
+            try
+            {
+                var resolved = SandboxPath.Resolve(filePath);
+                _workbook?.Dispose();
+                _workbook = new Workbook();
+                _autoWidthCols.Clear();
+                _workbook.Save(resolved);
+                _filePath = resolved;
+                _dirty = false;
+                Log.LogStep($"SpreadsheetTool.Create: created '{resolved}'");
+                return "true";
+            }
+            catch (Exception ex)
+            {
+                return $"Error: {ex.Message}";
+            }
         }
 
         /// <summary>
         /// Writes all pending changes to the current file path — an explicit checkpoint.
         /// (Changes are also persisted automatically when the tool is disposed, so the file
         /// on disk always reflects the final session state.)
+        /// A save that would produce an unreadable file is rejected: the previous file is left
+        /// untouched and no version is created.
         /// The new content becomes a new version in the workspace git repo (rollback via GitTool.restore).
         /// </summary>
-        /// <returns>A message describing the result: the new version id, or "No changes to save" if nothing loaded.</returns>
+        /// <returns>A message describing the result: the new version id, or an error when the
+        /// save was rejected.</returns>
         public string Save()
         {
             if (_workbook == null) return "No changes to save — no workbook is open.";
+            if (!_dirty) return "No changes to save — the workbook is unchanged since the last save.";
 
-            _workbook.Save(_filePath);
-            PatchChartCaches(_filePath);
+            var validationError = PersistValidated(_filePath);
+            if (validationError != null)
+            {
+                Log.LogStep($"SpreadsheetTool.Save: REJECTED — {validationError}");
+                return "Error: save rejected — the workbook could not be saved correctly; the previous file and the last git version are untouched.";
+            }
+
             var versionId = GitSupport.Snapshot(_filePath, "SpreadsheetTool save");
+            _dirty = false;
             Log.LogStep($"SpreadsheetTool.Save: saved to '{_filePath}', version='{versionId}'");
             return versionId != null
                 ? $"Workbook saved to '{Path.GetFileName(_filePath)}'. New version: {versionId}. (Rollback via GitTool.restore.)"
@@ -114,19 +140,26 @@ namespace AIOrchestrator.API
         /// <summary>
         /// Writes all pending changes to a new file path.
         /// Subsequent Save() calls will use the new path.
+        /// A save that would produce an unreadable file is rejected: the target file is not created.
         /// The new content becomes a new version in the workspace git repo.
         /// </summary>
         /// <param name="newFilePath">Path for the new .xlsx file, Unix style relative to the workspace root (e.g. "/folder/file.xlsx").</param>
-        /// <returns>A message describing the result.</returns>
+        /// <returns>A message describing the result, or an error when the save was rejected.</returns>
         public string SaveAs(string newFilePath)
         {
             if (_workbook == null) return "No changes to save — no workbook is open.";
 
             var resolved = SandboxPath.Resolve(newFilePath);
-            _workbook.Save(resolved);
-            PatchChartCaches(resolved);
+            var validationError = PersistValidated(resolved);
+            if (validationError != null)
+            {
+                Log.LogStep($"SpreadsheetTool.SaveAs: REJECTED — {validationError}");
+                return "Error: save rejected — the workbook could not be saved correctly; the target file was not created.";
+            }
+
             _filePath = resolved;
             var versionId = GitSupport.Snapshot(_filePath, "SpreadsheetTool save as");
+            _dirty = false;
             Log.LogStep($"SpreadsheetTool.SaveAs: saved to '{_filePath}', version='{versionId}'");
             return versionId != null
                 ? $"Workbook saved as '{Path.GetFileName(resolved)}'. New version: {versionId}."
@@ -147,11 +180,17 @@ namespace AIOrchestrator.API
                 _workbook.Dispose();   // release the open handle so the file can be overwritten
                 var message = GitSupport.Restore(versionId, _filePath);
                 _workbook = new Workbook(_filePath);
+                _dirty = false;        // reloaded state matches the file on disk
                 return message;
             }
             catch (Exception ex)
             {
-                try { if (_workbook == null) _workbook = new Workbook(_filePath); } catch { }
+                // Never leave the tool with a null workbook: reload the file (git restores it
+                // atomically per file) or fall back to a blank workbook so later calls keep
+                // working; the agent still gets a descriptive error.
+                try { if (_workbook == null) _workbook = new Workbook(_filePath); }
+                catch { _workbook = new Workbook(); _filePath = string.Empty; }
+                _dirty = true;
                 return $"Error: Restore failed: {ex.Message}";
             }
         }
@@ -160,19 +199,27 @@ namespace AIOrchestrator.API
         /// Explicit interface implementation — NOT an agent tool (the orchestrator disposes
         /// agents automatically when the loop ends). Persists any unsaved changes first so the
         /// file on disk always reflects the final session state, then releases the workbook.
+        /// A save that fails is not committed: the last good file stays on disk.
         /// </summary>
         void IDisposable.Dispose()
         {
             try
             {
-                if (_workbook != null && !string.IsNullOrEmpty(_filePath))
+                if (_workbook != null && !string.IsNullOrEmpty(_filePath) && _dirty)
                 {
-                    _workbook.Save(_filePath);
-                    PatchChartCaches(_filePath);
-                    var versionId = GitSupport.Snapshot(_filePath, "SpreadsheetTool auto-save");
-                    Log.LogStep(versionId != null
-                        ? $"SpreadsheetTool.Dispose: auto-saved '{_filePath}' (version '{versionId}')"
-                        : $"SpreadsheetTool.Dispose: auto-saved '{_filePath}' (no changes)");
+                    var validationError = PersistValidated(_filePath);
+                    if (validationError != null)
+                    {
+                        Log.LogStep($"SpreadsheetTool.Dispose: auto-save REJECTED — {validationError} (file on disk left untouched)");
+                    }
+                    else
+                    {
+                        var versionId = GitSupport.Snapshot(_filePath, "SpreadsheetTool auto-save");
+                        _dirty = false;
+                        Log.LogStep(versionId != null
+                            ? $"SpreadsheetTool.Dispose: auto-saved '{_filePath}' (version '{versionId}')"
+                            : $"SpreadsheetTool.Dispose: auto-saved '{_filePath}' (no changes)");
+                    }
                 }
             }
             catch (Exception ex)
@@ -209,13 +256,23 @@ namespace AIOrchestrator.API
         /// </summary>
         /// <param name="currentName">Current worksheet name (case-sensitive, from GetSheetNames()).</param>
         /// <param name="newName">New worksheet name.</param>
-        /// <returns>True if the sheet was renamed.</returns>
-        public bool RenameWorksheet(string currentName, string newName)
+        /// <returns>"true", or "Error: …" when the sheet is missing or the name is taken.</returns>
+        public string RenameWorksheet(string currentName, string newName)
         {
+            if (string.IsNullOrWhiteSpace(newName)) return "Error: new worksheet name is required";
             var ws = FindSheet(currentName);
-            if (ws == null) return false;
+            if (ws == null) return $"Error: worksheet '{currentName}' not found";
+            if (FindSheet(newName) != null) return $"Error: worksheet '{newName}' already exists";
+            // Keep the auto-width state with the sheet: the fresh-column cache is keyed by name.
+            if (_autoWidthCols.TryGetValue(currentName, out var set))
+            {
+                _autoWidthCols.Remove(currentName);
+                _autoWidthCols[newName] = set;
+            }
             ws.Name = newName;
-            return true;
+            Log.LogStep($"SpreadsheetTool.RenameWorksheet: '{currentName}' → '{newName}'");
+            _dirty = true;
+            return "true";
         }
 
         /// <summary>
@@ -223,13 +280,15 @@ namespace AIOrchestrator.API
         /// </summary>
         /// <param name="sheetName">Worksheet name (from GetSheetNames()).</param>
         /// <param name="show">True to show gridlines, false to hide them.</param>
-        /// <returns>True if the setting was applied.</returns>
-        public bool ShowGridlines(string sheetName, bool show)
+        /// <returns>"true", or "Error: …" when the sheet is missing.</returns>
+        public string ShowGridlines(string sheetName, bool show)
         {
             var ws = FindSheet(sheetName);
-            if (ws == null) return false;
+            if (ws == null) return $"Error: worksheet '{sheetName}' not found";
             ws.ShowGridlines = show;
-            return true;
+            Log.LogStep($"SpreadsheetTool.ShowGridlines: '{sheetName}' show={show}");
+            _dirty = true;
+            return "true";
         }
 
         /// <summary>
@@ -237,13 +296,15 @@ namespace AIOrchestrator.API
         /// </summary>
         /// <param name="sheetName">Worksheet name (from GetSheetNames()).</param>
         /// <param name="show">True to show headers, false to hide them.</param>
-        /// <returns>True if the setting was applied.</returns>
-        public bool ShowRowColumnHeaders(string sheetName, bool show)
+        /// <returns>"true", or "Error: …" when the sheet is missing.</returns>
+        public string ShowRowColumnHeaders(string sheetName, bool show)
         {
             var ws = FindSheet(sheetName);
-            if (ws == null) return false;
+            if (ws == null) return $"Error: worksheet '{sheetName}' not found";
             ws.ShowRowColumnHeaders = show;
-            return true;
+            Log.LogStep($"SpreadsheetTool.ShowRowColumnHeaders: '{sheetName}' show={show}");
+            _dirty = true;
+            return "true";
         }
 
         /// <summary>
@@ -252,13 +313,16 @@ namespace AIOrchestrator.API
         /// </summary>
         /// <param name="sheetName">Worksheet name (from GetSheetNames()).</param>
         /// <param name="zoomPercentage">Zoom level between 10 and 400.</param>
-        /// <returns>True if zoom was set.</returns>
-        public bool SetZoom(string sheetName, int zoomPercentage)
+        /// <returns>"true", or "Error: …" when the sheet is missing or the zoom is out of range.</returns>
+        public string SetZoom(string sheetName, int zoomPercentage)
         {
             var ws = FindSheet(sheetName);
-            if (ws == null) return false;
+            if (ws == null) return $"Error: worksheet '{sheetName}' not found";
+            if (zoomPercentage < 10 || zoomPercentage > 400) return $"Error: zoom must be between 10 and 400 (got {zoomPercentage})";
             ws.Zoom = zoomPercentage;
-            return true;
+            Log.LogStep($"SpreadsheetTool.SetZoom: '{sheetName}' zoom={zoomPercentage}");
+            _dirty = true;
+            return "true";
         }
 
         /// <summary>
@@ -266,13 +330,15 @@ namespace AIOrchestrator.API
         /// After protection, cells marked as locked (true by default) become read-only.
         /// </summary>
         /// <param name="sheetName">Worksheet name (from GetSheetNames()).</param>
-        /// <returns>True if the sheet was protected.</returns>
-        public bool ProtectSheet(string sheetName)
+        /// <returns>"true", or "Error: …" when the sheet is missing.</returns>
+        public string ProtectSheet(string sheetName)
         {
             var ws = FindSheet(sheetName);
-            if (ws == null) return false;
+            if (ws == null) return $"Error: worksheet '{sheetName}' not found";
             ws.Protect();
-            return true;
+            Log.LogStep($"SpreadsheetTool.ProtectSheet: '{sheetName}'");
+            _dirty = true;
+            return "true";
         }
 
         /// <summary>
@@ -280,30 +346,33 @@ namespace AIOrchestrator.API
         /// allowing edits to locked cells again.
         /// </summary>
         /// <param name="sheetName">Worksheet name (from GetSheetNames()).</param>
-        /// <returns>True if the sheet was unprotected.</returns>
-        public bool UnprotectSheet(string sheetName)
+        /// <returns>"true", or "Error: …" when the sheet is missing.</returns>
+        public string UnprotectSheet(string sheetName)
         {
             var ws = FindSheet(sheetName);
-            if (ws == null) return false;
+            if (ws == null) return $"Error: worksheet '{sheetName}' not found";
             ws.Unprotect();
-            return true;
+            Log.LogStep($"SpreadsheetTool.UnprotectSheet: '{sheetName}'");
+            _dirty = true;
+            return "true";
         }
 
         /// <summary>Adds a new, empty worksheet to the workbook.</summary>
         /// <param name="name">Name for the new worksheet (e.g. "Riepilogo"). Must be unique in the workbook.</param>
-        /// <returns>True if the worksheet was added.</returns>
-        public bool AddWorksheet(string name)
+        /// <returns>"true", or "Error: …" when the name is invalid or already taken.</returns>
+        public string AddWorksheet(string name)
         {
             try
             {
                 _workbook.Worksheets.Add(name);
+                _dirty = true;
                 Log.LogStep($"SpreadsheetTool.AddWorksheet: added '{name}'");
-                return true;
+                return "true";
             }
             catch (Exception ex)
             {
                 Log.LogStep($"SpreadsheetTool.AddWorksheet: FAILED — {ex.Message}");
-                return false;
+                return $"Error: {ex.Message}";
             }
         }
 
@@ -321,7 +390,8 @@ namespace AIOrchestrator.API
         public string? GetCellValue(string sheetName, string cellReference)
         {
             var ws = FindSheet(sheetName);
-            return ws?.Cells[cellReference]?.DisplayStringValue;
+            if (ws == null || !TryParseCellRef(cellReference).Ok) return null;
+            return ws.Cells[cellReference]?.DisplayStringValue;
         }
 
         /// <summary>
@@ -330,17 +400,19 @@ namespace AIOrchestrator.API
         /// <param name="sheetName">Worksheet name (case-sensitive, from GetSheetNames()).</param>
         /// <param name="cellReference">Cell reference in A1 notation (e.g. "A1", "C5").</param>
         /// <param name="value">The value to write. Parsed automatically.</param>
-        /// <returns>True if the cell was updated.</returns>
-        public bool SetCellValue(string sheetName, string cellReference, string value)
+        /// <returns>"true", or "Error: …" when the sheet or the cell reference is invalid.</returns>
+        public string SetCellValue(string sheetName, string cellReference, string value)
         {
             var ws = FindSheet(sheetName);
-            if (ws == null) return false;
-            var (_, col) = ParseCellRef(cellReference);
-            var fresh = IsFreshColumn(ws, col);
+            if (ws == null) return $"Error: worksheet '{sheetName}' not found";
+            var p = TryParseCellRef(cellReference);
+            if (!p.Ok) return $"Error: {p.Error}";
+            var fresh = IsFreshColumn(ws, p.Col);
             SetCellValueAuto(ws.Cells[cellReference], value);
-            if (fresh) ApplyAutoWidth(ws, col, new[] { value }); // first write to a fresh column → auto width
+            if (fresh) ApplyAutoWidth(ws, p.Col, new[] { value }); // first write to a fresh column → auto width
+            _dirty = true;
             Log.LogStep($"SpreadsheetTool.SetCellValue: '{sheetName}'!{cellReference} = '{value}'");
-            return true;
+            return "true";
         }
 
         /// <summary>
@@ -354,7 +426,7 @@ namespace AIOrchestrator.API
         public string? GetCellFormula(string sheetName, string cellReference)
         {
             var ws = FindSheet(sheetName);
-            if (ws == null) return null;
+            if (ws == null || !TryParseCellRef(cellReference).Ok) return null;
             var f = ws.Cells[cellReference]?.Formula;
             return string.IsNullOrEmpty(f) ? null : f;
         }
@@ -366,18 +438,44 @@ namespace AIOrchestrator.API
         /// <param name="sheetName">Worksheet name (case-sensitive, from GetSheetNames()).</param>
         /// <param name="cellReference">Cell reference in A1 notation (e.g. "A1").</param>
         /// <param name="formula">Formula including the leading '=' (e.g. "=SUM(B2:B10)").</param>
-        /// <returns>True if the formula was set.</returns>
-        public bool SetCellFormula(string sheetName, string cellReference, string formula)
+        /// <returns>"true", or "Error: …" when the sheet or the cell reference is invalid.</returns>
+        public string SetCellFormula(string sheetName, string cellReference, string formula)
         {
             var ws = FindSheet(sheetName);
-            if (ws == null) return false;
+            if (ws == null) return $"Error: worksheet '{sheetName}' not found";
+            var p = TryParseCellRef(cellReference);
+            if (!p.Ok) return $"Error: {p.Error}";
             var cell = ws.Cells[cellReference];
-            if (cell == null) return false;
-            var (_, col) = ParseCellRef(cellReference);
-            var fresh = IsFreshColumn(ws, col);
+            if (cell == null) return $"Error: cell '{cellReference}' not found";
+            var fresh = IsFreshColumn(ws, p.Col);
             cell.Formula = formula;
-            if (fresh) ApplyAutoWidth(ws, col, new[] { formula });
-            return true;
+            if (fresh) ApplyAutoWidth(ws, p.Col, new[] { formula });
+            Log.LogStep($"SpreadsheetTool.SetCellFormula: '{sheetName}'!{cellReference} = {formula}");
+            _dirty = true;
+            return "true";
+        }
+
+        /// <summary>
+        /// Returns value, formula and type of a cell in a single call — the agent needs one
+        /// round-trip instead of GetCellValue + GetCellFormula + GetCellType.
+        /// Value is the display string; Formula is null when the cell has none.
+        /// </summary>
+        /// <param name="sheetName">Worksheet name (from GetSheetNames()).</param>
+        /// <param name="cellReference">Cell reference in A1 notation (e.g. "A1").</param>
+        /// <returns>JSON with "value", "formula" and "type" keys, or null if not found.</returns>
+        public string? GetCellInfo(string sheetName, string cellReference)
+        {
+            var ws = FindSheet(sheetName);
+            if (ws == null || !TryParseCellRef(cellReference).Ok) return null;
+            var cell = ws.Cells[cellReference];
+            if (cell == null) return null;
+            var f = cell.Formula;
+            return System.Text.Json.JsonSerializer.Serialize(new Dictionary<string, object?>
+            {
+                ["value"] = cell.DisplayStringValue,
+                ["formula"] = string.IsNullOrEmpty(f) ? null : f,
+                ["type"] = GetCellType(sheetName, cellReference),
+            });
         }
 
         /// <summary>
@@ -391,7 +489,8 @@ namespace AIOrchestrator.API
         public string? GetCellType(string sheetName, string cellReference)
         {
             var ws = FindSheet(sheetName);
-            var cell = ws?.Cells[cellReference];
+            if (ws == null || !TryParseCellRef(cellReference).Ok) return null;
+            var cell = ws.Cells[cellReference];
             if (cell == null) return null;
             return cell.Type switch
             {
@@ -421,9 +520,12 @@ namespace AIOrchestrator.API
         {
             var ws = FindSheet(sheetName);
             if (ws == null) return null;
+            var a = TryParseCellRef(startCell);
+            var b = TryParseCellRef(endCell);
+            if (!a.Ok || !b.Ok) return null;
 
-            var (startRow, startCol) = ParseCellRef(startCell);
-            var (endRow, endCol) = ParseCellRef(endCell);
+            var (startRow, startCol) = (Math.Min(a.Row, b.Row), Math.Min(a.Col, b.Col));
+            var (endRow, endCol) = (Math.Max(a.Row, b.Row), Math.Max(a.Col, b.Col));
 
             int rows = endRow - startRow + 1;
             int cols = endCol - startCol + 1;
@@ -448,27 +550,44 @@ namespace AIOrchestrator.API
         /// <param name="sheetName">Worksheet name (case-sensitive, from GetSheetNames()).</param>
         /// <param name="startCell">Top-left cell (e.g. "A1").</param>
         /// <param name="values">2D array of STRINGS [row][col]; pass numbers as strings (e.g. "14500") — the tool auto-detects and stores them as numbers. Rows may have different lengths.</param>
-        /// <returns>True if the data was written.</returns>
-        public bool SetRange(string sheetName, string startCell, string[][] values)
+        /// <returns>"true", or "Error: …" when the sheet/cell reference is invalid or the block
+        /// is too large (nothing is written on error).</returns>
+        public string SetRange(string sheetName, string startCell, string[][] values)
         {
             var ws = FindSheet(sheetName);
-            if (ws == null || values.Length == 0) return false;
+            if (ws == null) return $"Error: worksheet '{sheetName}' not found";
+            if (values == null || values.Length == 0) return "Error: no rows to write";
+            var p = TryParseCellRef(startCell);
+            if (!p.Ok) return $"Error: {p.Error}";
 
-            var (startRow, startCol) = ParseCellRef(startCell);
+            // Guard the whole block BEFORE writing a single cell: a partial write followed by a
+            // later failure would leave the workbook half-modified with no way to report it.
+            // Null rows are treated as empty rows — an irregular block must never throw.
+            int maxCols = values.Max(r => r?.Length ?? 0);
+            long area = values.Sum(r => (long)(r?.Length ?? 0));
+            if (maxCols == 0) return "Error: no values to write";
+            if (area > MaxCellArea) return $"Error: the values block is too large ({area} cells, max {MaxCellArea})";
+            if (p.Row + values.Length > 1_048_576) return "Error: the values block extends past the last row (1048576)";
+
+            var (startRow, startCol) = (p.Row, p.Col);
 
             // Fresh columns (first use in this session, no prior content) get an auto width.
+            // Scan across ALL rows, not just the first: a row wider than row 0 must still
+            // auto-fit its extra columns.
             var freshCols = new List<(int Col, List<string> Written)>();
-            for (int c = 0; c < values[0].Length; c++)
+            for (int c = 0; c < maxCols; c++)
             {
                 if (!IsFreshColumn(ws, startCol + c)) continue;
                 var written = new List<string>();
-                for (int r = 0; r < values.Length && c < values[r].Length; r++)
-                    written.Add(values[r][c]);
+                for (int r = 0; r < values.Length; r++)
+                    if (values[r] != null && c < values[r].Length)
+                        written.Add(values[r][c]);
                 freshCols.Add((startCol + c, written));
             }
 
             for (int r = 0; r < values.Length; r++)
             {
+                if (values[r] == null) continue;
                 for (int c = 0; c < values[r].Length; c++)
                 {
                     var cell = ws.Cells[startRow + r, startCol + c];
@@ -480,44 +599,54 @@ namespace AIOrchestrator.API
             foreach (var (col, written) in freshCols)
                 ApplyAutoWidth(ws, col, written);
 
+            _dirty = true;
             Log.LogStep($"SpreadsheetTool.SetRange: '{sheetName}'!{startCell} ({values.Length} rows)");
-            return true;
+            return "true";
         }
 
         /// <summary>
         /// Appends rows after the last used row on the worksheet.
-        /// Scans column A for the first empty cell, then writes from there.
+        /// The last used row is detected across ALL columns (values AND formulas), so rows are
+        /// never appended on top of existing content.
         /// </summary>
         /// <param name="sheetName">Worksheet name (case-sensitive, from GetSheetNames()).</param>
         /// <param name="rows">Array of rows to append.</param>
-        /// <returns>True if the rows were appended.</returns>
-        public bool AppendRows(string sheetName, string[][] rows)
+        /// <returns>"true", or "Error: …" when the sheet is missing or the block is too large
+        /// (nothing is written on error).</returns>
+        public string AppendRows(string sheetName, string[][] rows)
         {
             var ws = FindSheet(sheetName);
-            if (ws == null || rows.Length == 0) return false;
+            if (ws == null) return $"Error: worksheet '{sheetName}' not found";
+            if (rows == null || rows.Length == 0 || rows[0].Length == 0) return "Error: no rows to append";
 
-            int startRow = 0;
-            while (true)
-            {
-                var cell = ws.Cells[startRow, 0];
-                if (cell == null || string.IsNullOrEmpty(cell.DisplayStringValue))
-                    break;
-                startRow++;
-            }
+            // Append AFTER the true last used row: the max over ALL columns of a value-OR-formula
+            // scan. A display-only scan on column A would (a) ignore data sitting in other columns
+            // and (b) stop at the first formula cell (formulas display as empty without
+            // recalculation) — both would append on top of existing content and overwrite it.
+            int startRow = FindLastUsedRow(ws) + 1;
 
-            // Auto width for columns that had no content before this append.
+            int maxCols = rows.Max(r => r?.Length ?? 0);
+            long area = rows.Sum(r => (long)(r?.Length ?? 0));
+            if (maxCols == 0) return "Error: no values to append";
+            if (area > MaxCellArea) return $"Error: the rows block is too large ({area} cells, max {MaxCellArea})";
+            if (startRow + rows.Length > 1_048_576) return "Error: the rows block extends past the last row (1048576)";
+
+            // Auto width for columns that had no content before this append. Scan across ALL
+            // rows: a row wider than row 0 must still auto-fit its extra columns.
             var freshCols = new List<(int Col, List<string> Written)>();
-            for (int c = 0; c < rows[0].Length; c++)
+            for (int c = 0; c < maxCols; c++)
             {
                 if (!IsFreshColumn(ws, c)) continue;
                 var written = new List<string>();
-                for (int r = 0; r < rows.Length && c < rows[r].Length; r++)
-                    written.Add(rows[r][c]);
+                for (int r = 0; r < rows.Length; r++)
+                    if (rows[r] != null && c < rows[r].Length)
+                        written.Add(rows[r][c]);
                 freshCols.Add((c, written));
             }
 
             for (int r = 0; r < rows.Length; r++)
             {
+                if (rows[r] == null) continue;
                 for (int c = 0; c < rows[r].Length; c++)
                 {
                     var cell = ws.Cells[startRow + r, c];
@@ -529,8 +658,9 @@ namespace AIOrchestrator.API
             foreach (var (col, written) in freshCols)
                 ApplyAutoWidth(ws, col, written);
 
+            _dirty = true;
             Log.LogStep($"SpreadsheetTool.AppendRows: '{sheetName}' ({rows.Length} rows from row {startRow})");
-            return true;
+            return "true";
         }
 
         // ──────────────────────────────────────────────
@@ -543,236 +673,18 @@ namespace AIOrchestrator.API
         /// </summary>
         /// <param name="sheetName">Worksheet name (case-sensitive, from GetSheetNames()).</param>
         /// <param name="range">Range in A1 notation (e.g. "A1:C3").</param>
-        /// <returns>True if the cells were merged.</returns>
-        public bool MergeCells(string sheetName, string range)
+        /// <returns>"true", or "Error: …" when the sheet or the range is invalid.</returns>
+        public string MergeCells(string sheetName, string range)
         {
             var ws = FindSheet(sheetName);
-            if (ws == null) return false;
+            if (ws == null) return $"Error: worksheet '{sheetName}' not found";
+            var p = TryParseRange(range);
+            if (!p.Ok) return $"Error: {p.Error}";
 
-            var (startRef, endRef) = ParseRange(range);
-            var (startRow, startCol) = ParseCellRef(startRef);
-            var (endRow, endCol) = ParseCellRef(endRef);
-
-            int totalRows = endRow - startRow + 1;
-            int totalCols = endCol - startCol + 1;
-            ws.Cells.Merge(startRow, startCol, totalRows, totalCols);
+            ws.Cells.Merge(p.R1, p.C1, p.R2 - p.R1 + 1, p.C2 - p.C1 + 1);
+            _dirty = true;
             Log.LogStep($"SpreadsheetTool.MergeCells: '{sheetName}'!{range}");
-            return true;
-        }
-
-        // ──────────────────────────────────────────────
-        //  Style — font
-        // ──────────────────────────────────────────────
-
-        /// <summary>
-        /// Sets font properties (name, size, bold, italic, color) on one or more cells.
-        /// Specify a cell (e.g. "A1") or range (e.g. "A1:C10").
-        /// Colors use "#RRGGBB" hex format (e.g. "#FF0000" for red).
-        /// Pass null / 0 to leave a property unchanged.
-        /// </summary>
-        /// <param name="sheetName">Worksheet name (from GetSheetNames()).</param>
-        /// <param name="cellOrRange">Cell reference or range (e.g. "A1" or "A1:C10").</param>
-        /// <param name="fontName">Font family (e.g. "Calibri", "Arial").</param>
-        /// <param name="fontSize">Size in points (e.g. 11).</param>
-        /// <param name="bold">True = bold.</param>
-        /// <param name="italic">True = italic.</param>
-        /// <param name="fontColorHex">Font color "#RRGGBB".</param>
-        /// <returns>True if the font was applied.</returns>
-        public bool SetCellFont(string sheetName, string cellOrRange,
-            string? fontName = null, double fontSize = 0,
-            bool? bold = null, bool? italic = null, string? fontColorHex = null)
-        {
-            var ws = FindSheet(sheetName);
-            if (ws == null) return false;
-            var cells = ResolveCells(ws, cellOrRange);
-            if (cells == null) return false;
-
-            foreach (var cell in cells)
-            {
-                if (cell == null) continue;
-                var style = cell.GetStyle();
-                if (!string.IsNullOrEmpty(fontName)) style.Font.Name = fontName;
-                if (fontSize > 0) style.Font.Size = fontSize;
-                if (bold.HasValue) style.Font.IsBold = bold.Value;
-                if (italic.HasValue) style.Font.IsItalic = italic.Value;
-                if (!string.IsNullOrEmpty(fontColorHex)) style.Font.Color = ParseColor(fontColorHex);
-                cell.SetStyle(style);
-            }
-            return true;
-        }
-
-        // ──────────────────────────────────────────────
-        //  Style — fill (background color)
-        // ──────────────────────────────────────────────
-
-        /// <summary>
-        /// Sets the background (fill) color of one or more cells.
-        /// Pass null or "none" to remove the fill.
-        /// </summary>
-        /// <param name="sheetName">Worksheet name (from GetSheetNames()).</param>
-        /// <param name="cellOrRange">Cell or range (e.g. "A1" or "A1:C10").</param>
-        /// <param name="colorHex">Background color "#RRGGBB" (e.g. "#FFFF00" for yellow). Null or "none" clears fill.</param>
-        /// <returns>True if the fill was applied.</returns>
-        public bool SetCellFill(string sheetName, string cellOrRange, string? colorHex = null)
-        {
-            var ws = FindSheet(sheetName);
-            if (ws == null) return false;
-            var cells = ResolveCells(ws, cellOrRange);
-            if (cells == null) return false;
-
-            foreach (var cell in cells)
-            {
-                if (cell == null) continue;
-                var style = cell.GetStyle();
-                if (string.IsNullOrEmpty(colorHex) || colorHex.Equals("none", StringComparison.OrdinalIgnoreCase))
-                {
-                    style.Pattern = FillPattern.None;
-                }
-                else
-                {
-                    style.Pattern = FillPattern.Solid;
-                    style.ForegroundColor = ParseColor(colorHex);
-                }
-                cell.SetStyle(style);
-            }
-            return true;
-        }
-
-        // ──────────────────────────────────────────────
-        //  Style — alignment
-        // ──────────────────────────────────────────────
-
-        /// <summary>
-        /// Sets horizontal/vertical alignment and text wrapping on one or more cells.
-        /// Horizontal: "General", "Left", "Center", "Right", "Fill", "Justify", "CenterAcrossSelection", "Distributed"
-        /// Vertical: "Top", "Center", "Bottom", "Justify", "Distributed"
-        /// Pass null to leave a property unchanged.
-        /// </summary>
-        /// <param name="sheetName">Worksheet name (from GetSheetNames()).</param>
-        /// <param name="cellOrRange">Cell or range (e.g. "A1" or "A1:C10").</param>
-        /// <param name="horizontalAlignment">Horizontal alignment value.</param>
-        /// <param name="verticalAlignment">Vertical alignment value.</param>
-        /// <param name="wrapText">True = wrap, false = no wrap.</param>
-        /// <returns>True if alignment was applied.</returns>
-        public bool SetCellAlignment(string sheetName, string cellOrRange,
-            string? horizontalAlignment = null, string? verticalAlignment = null, bool? wrapText = null)
-        {
-            var ws = FindSheet(sheetName);
-            if (ws == null) return false;
-            var cells = ResolveCells(ws, cellOrRange);
-            if (cells == null) return false;
-
-            foreach (var cell in cells)
-            {
-                if (cell == null) continue;
-                var style = cell.GetStyle();
-                if (!string.IsNullOrEmpty(horizontalAlignment))
-                    style.HorizontalAlignment = ParseHorizontalAlignment(horizontalAlignment);
-                if (!string.IsNullOrEmpty(verticalAlignment))
-                    style.VerticalAlignment = ParseVerticalAlignment(verticalAlignment);
-                if (wrapText.HasValue)
-                    style.WrapText = wrapText.Value;
-                cell.SetStyle(style);
-            }
-            return true;
-        }
-
-        // ──────────────────────────────────────────────
-        //  Style — number format
-        // ──────────────────────────────────────────────
-
-        /// <summary>
-        /// Sets a custom number format code on one or more cells.
-        /// Common codes:
-        ///   "#,##0.00" — thousands + 2 decimals
-        ///   "€ #,##0.00" — euro currency
-        ///   "0%" — percentage
-        ///   "0.00%" — percentage with 2 decimals
-        ///   "dd/mm/yyyy" — date
-        ///   "dd/mm/yyyy hh:mm" — date + time
-        ///   "@" — text
-        /// </summary>
-        /// <param name="sheetName">Worksheet name (from GetSheetNames()).</param>
-        /// <param name="cellOrRange">Cell or range (e.g. "A1" or "A1:C10").</param>
-        /// <param name="formatCode">Custom number format code (e.g. "#,##0.00").</param>
-        /// <returns>True if the format was applied.</returns>
-        public bool SetCellNumberFormat(string sheetName, string cellOrRange, string formatCode)
-        {
-            var ws = FindSheet(sheetName);
-            if (ws == null) return false;
-            var cells = ResolveCells(ws, cellOrRange);
-            if (cells == null) return false;
-
-            foreach (var cell in cells)
-            {
-                if (cell == null) continue;
-                var style = cell.GetStyle();
-                style.Custom = formatCode;
-                cell.SetStyle(style);
-            }
-            return true;
-        }
-
-        // ──────────────────────────────────────────────
-        //  Style — borders
-        // ──────────────────────────────────────────────
-
-        /// <summary>
-        /// Applies borders to one or more cells.
-        /// Styles: "None", "Thin", "Medium", "Thick", "Dotted", "Dashed", "Double", "Hair"
-        /// Sides: "All", "Outline", "Inside", "Top", "Bottom", "Left", "Right"
-        /// </summary>
-        /// <param name="sheetName">Worksheet name (from GetSheetNames()).</param>
-        /// <param name="cellOrRange">Cell or range (e.g. "A1" or "A1:C10").</param>
-        /// <param name="borderStyle">Line style (default "Thin").</param>
-        /// <param name="borderSide">Which sides (default "All").</param>
-        /// <param name="borderColorHex">Color "#RRGGBB" (default black).</param>
-        /// <returns>True if borders were applied.</returns>
-        public bool SetCellBorders(string sheetName, string cellOrRange,
-            string borderStyle = "Thin", string borderSide = "All", string? borderColorHex = null)
-        {
-            var ws = FindSheet(sheetName);
-            if (ws == null) return false;
-            var cells = ResolveCells(ws, cellOrRange);
-            if (cells == null) return false;
-
-            var styleType = ParseBorderStyle(borderStyle);
-            var color = !string.IsNullOrEmpty(borderColorHex)
-                ? ParseColor(borderColorHex)
-                : Color.FromArgb(255, 0, 0, 0);
-            var sides = ParseBorderSides(borderSide);
-
-            foreach (var cell in cells)
-            {
-                if (cell == null) continue;
-                var style = cell.GetStyle();
-                var borders = style.Borders;
-
-                foreach (var side in sides)
-                {
-                    switch (side)
-                    {
-                        case "Top":
-                            borders.Top.LineStyle = styleType;
-                            borders.Top.Color = color;
-                            break;
-                        case "Bottom":
-                            borders.Bottom.LineStyle = styleType;
-                            borders.Bottom.Color = color;
-                            break;
-                        case "Left":
-                            borders.Left.LineStyle = styleType;
-                            borders.Left.Color = color;
-                            break;
-                        case "Right":
-                            borders.Right.LineStyle = styleType;
-                            borders.Right.Color = color;
-                            break;
-                    }
-                }
-                cell.SetStyle(style);
-            }
-            return true;
+            return "true";
         }
 
         // ──────────────────────────────────────────────
@@ -780,9 +692,13 @@ namespace AIOrchestrator.API
         // ──────────────────────────────────────────────
 
         /// <summary>
-        /// Applies multiple style properties in a single call.
+        /// Applies multiple style properties in a single call — the ONLY style method the agent
+        /// needs (font, fill, alignment, wrap, number format and borders).
         /// Only non-null/non-default parameters are applied.
-        /// Colors: "#RRGGBB". Horizontal: "Left","Center","Right". Vertical: "Top","Center","Bottom".
+        /// Colors: "#RRGGBB". Pass fillColorHex "none" to remove the fill.
+        /// Horizontal: "Left","Center","Right". Vertical: "Top","Center","Bottom".
+        /// Border styles: "Thin","Medium","Thick","Dotted","Dashed","Double","Hair".
+        /// Border sides: "All","Outline","Inside","Top","Bottom","Left","Right".
         /// </summary>
         /// <param name="sheetName">Worksheet name (from GetSheetNames()).</param>
         /// <param name="cellOrRange">Cell or range (e.g. "A1" or "A1:C10").</param>
@@ -791,54 +707,126 @@ namespace AIOrchestrator.API
         /// <param name="bold">True = bold.</param>
         /// <param name="italic">True = italic.</param>
         /// <param name="fontColorHex">Font color "#RRGGBB".</param>
-        /// <param name="fillColorHex">Background color "#RRGGBB".</param>
+        /// <param name="fillColorHex">Background color "#RRGGBB", or "none" to remove the fill.</param>
         /// <param name="horizontalAlignment">Horizontal: "Left","Center","Right".</param>
         /// <param name="verticalAlignment">Vertical: "Top","Center","Bottom".</param>
         /// <param name="wrapText">True = wrap text.</param>
         /// <param name="numberFormat">Custom number format (e.g. "#,##0.00").</param>
-        /// <returns>True if the style was applied.</returns>
-        public bool ApplyStyle(string sheetName, string cellOrRange,
+        /// <param name="borderStyle">Border line style (e.g. "Thin"). Only applied when set.</param>
+        /// <param name="borderSide">Which sides to border (default "All").</param>
+        /// <param name="borderColorHex">Border color "#RRGGBB" (default black).</param>
+        /// <returns>"true", or "Error: …" if the style was applied.</returns>
+        public string ApplyStyle(string sheetName, string cellOrRange,
             string? fontName = null, double fontSize = 0,
             bool? bold = null, bool? italic = null,
             string? fontColorHex = null, string? fillColorHex = null,
             string? horizontalAlignment = null, string? verticalAlignment = null,
-            bool? wrapText = null, string? numberFormat = null)
+            bool? wrapText = null, string? numberFormat = null,
+            string? borderStyle = null, string? borderSide = null, string? borderColorHex = null)
         {
             var ws = FindSheet(sheetName);
-            if (ws == null) return false;
-            var cells = ResolveCells(ws, cellOrRange);
-            if (cells == null) return false;
+            if (ws == null) return $"Error: worksheet '{sheetName}' not found";
+            var guard = ValidateCellOrRange(cellOrRange);
+            if (guard != null) return $"Error: {guard}";
+            var p = TryParseRange(cellOrRange);
+            if (!p.Ok) return $"Error: {p.Error}";
+            var (r1, c1, r2, c2) = (p.R1, p.C1, p.R2, p.C2);
 
-            foreach (var cell in cells)
+            // Border parameters are resolved once, outside the cell loop. "Inside" borders only
+            // the edges BETWEEN cells (outer perimeter excluded); "Outline" borders only the
+            // outer perimeter; a single-cell range has no inner borders.
+            BorderStyleType? border = string.IsNullOrEmpty(borderStyle) ? null : ParseBorderStyle(borderStyle);
+            bool inside = borderSide?.Equals("Inside", StringComparison.OrdinalIgnoreCase) == true;
+            bool outline = borderSide?.Equals("Outline", StringComparison.OrdinalIgnoreCase) == true;
+            var sides = inside || outline
+                ? new[] { "Top", "Bottom", "Left", "Right" }
+                : ParseBorderSides(borderSide ?? "All");
+            var borderColor = !string.IsNullOrEmpty(borderColorHex)
+                ? ParseColor(borderColorHex)
+                : Color.FromArgb(255, 0, 0, 0);
+
+            for (int r = r1; r <= r2; r++)
             {
-                if (cell == null) continue;
-                var style = cell.GetStyle();
-
-                if (!string.IsNullOrEmpty(fontName)) style.Font.Name = fontName;
-                if (fontSize > 0) style.Font.Size = fontSize;
-                if (bold.HasValue) style.Font.IsBold = bold.Value;
-                if (italic.HasValue) style.Font.IsItalic = italic.Value;
-                if (!string.IsNullOrEmpty(fontColorHex)) style.Font.Color = ParseColor(fontColorHex);
-
-                if (!string.IsNullOrEmpty(fillColorHex))
+                for (int c = c1; c <= c2; c++)
                 {
-                    style.Pattern = FillPattern.Solid;
-                    style.ForegroundColor = ParseColor(fillColorHex);
+                    var cell = ws.Cells[r, c];
+                    if (cell == null) continue;
+                    var style = cell.GetStyle();
+
+                    if (!string.IsNullOrEmpty(fontName)) style.Font.Name = fontName;
+                    if (fontSize > 0) style.Font.Size = fontSize;
+                    if (bold.HasValue) style.Font.IsBold = bold.Value;
+                    if (italic.HasValue) style.Font.IsItalic = italic.Value;
+                    if (!string.IsNullOrEmpty(fontColorHex)) style.Font.Color = ParseColor(fontColorHex);
+
+                    if (!string.IsNullOrEmpty(fillColorHex))
+                    {
+                        if (fillColorHex.Equals("none", StringComparison.OrdinalIgnoreCase))
+                            style.Pattern = FillPattern.None;
+                        else
+                        {
+                            style.Pattern = FillPattern.Solid;
+                            style.ForegroundColor = ParseColor(fillColorHex);
+                        }
+                    }
+
+                    if (!string.IsNullOrEmpty(horizontalAlignment))
+                        style.HorizontalAlignment = ParseHorizontalAlignment(horizontalAlignment);
+                    if (!string.IsNullOrEmpty(verticalAlignment))
+                        style.VerticalAlignment = ParseVerticalAlignment(verticalAlignment);
+                    if (wrapText.HasValue)
+                        style.WrapText = wrapText.Value;
+                    if (!string.IsNullOrEmpty(numberFormat))
+                        style.Custom = numberFormat;
+
+                    if (border.HasValue)
+                    {
+                        var borders = style.Borders;
+                        foreach (var side in sides)
+                        {
+                            if (inside && !IsInnerEdge(side, r, c, r1, c1, r2, c2)) continue;
+                            if (outline && !IsOuterEdge(side, r, c, r1, c1, r2, c2)) continue;
+                            switch (side)
+                            {
+                                case "Top":
+                                    borders.Top.LineStyle = border.Value;
+                                    borders.Top.Color = borderColor;
+                                    break;
+                                case "Bottom":
+                                    borders.Bottom.LineStyle = border.Value;
+                                    borders.Bottom.Color = borderColor;
+                                    break;
+                                case "Left":
+                                    borders.Left.LineStyle = border.Value;
+                                    borders.Left.Color = borderColor;
+                                    break;
+                                case "Right":
+                                    borders.Right.LineStyle = border.Value;
+                                    borders.Right.Color = borderColor;
+                                    break;
+                            }
+                        }
+                    }
+
+                    cell.SetStyle(style);
                 }
-
-                if (!string.IsNullOrEmpty(horizontalAlignment))
-                    style.HorizontalAlignment = ParseHorizontalAlignment(horizontalAlignment);
-                if (!string.IsNullOrEmpty(verticalAlignment))
-                    style.VerticalAlignment = ParseVerticalAlignment(verticalAlignment);
-                if (wrapText.HasValue)
-                    style.WrapText = wrapText.Value;
-                if (!string.IsNullOrEmpty(numberFormat))
-                    style.Custom = numberFormat;
-
-                cell.SetStyle(style);
             }
-            return true;
+            Log.LogStep($"SpreadsheetTool.ApplyStyle: '{sheetName}'!{cellOrRange}");
+            _dirty = true;
+            return "true";
         }
+
+        /// <summary>True when the given side of cell (r,c) is an edge INSIDE the range (both
+        /// neighbors in range) — used for "Inside" borders, which skip the outer perimeter.</summary>
+        private static bool IsInnerEdge(string side, int r, int c, int r1, int c1, int r2, int c2) =>
+            (side == "Top" && r > r1) || (side == "Bottom" && r < r2)
+            || (side == "Left" && c > c1) || (side == "Right" && c < c2);
+
+        /// <summary>True when the given side of cell (r,c) lies on the outer perimeter of the
+        /// range — used for "Outline" borders.</summary>
+        private static bool IsOuterEdge(string side, int r, int c, int r1, int c1, int r2, int c2) =>
+            (side == "Top" && r == r1) || (side == "Bottom" && r == r2)
+            || (side == "Left" && c == c1) || (side == "Right" && c == c2);
 
         // ──────────────────────────────────────────────
         //  Style — header row shortcut
@@ -849,11 +837,11 @@ namespace AIOrchestrator.API
         /// Detects the used column count from row 0.
         /// </summary>
         /// <param name="sheetName">Worksheet name (from GetSheetNames()).</param>
-        /// <returns>True if the header was formatted.</returns>
-        public bool FormatHeaderRow(string sheetName)
+        /// <returns>"true", or "Error: …" when the sheet is missing or the header row is empty.</returns>
+        public string FormatHeaderRow(string sheetName)
         {
             var ws = FindSheet(sheetName);
-            if (ws == null) return false;
+            if (ws == null) return $"Error: worksheet '{sheetName}' not found";
 
             int maxCol = 0;
             while (true)
@@ -863,7 +851,7 @@ namespace AIOrchestrator.API
                     break;
                 maxCol++;
             }
-            if (maxCol == 0) return false;
+            if (maxCol == 0) return "Error: the header row is empty (no cells to format)";
 
             for (int c = 0; c < maxCol; c++)
             {
@@ -876,7 +864,9 @@ namespace AIOrchestrator.API
                 style.ForegroundColor = Color.FromArgb(255, 34, 120, 212);
                 cell.SetStyle(style);
             }
-            return true;
+            Log.LogStep($"SpreadsheetTool.FormatHeaderRow: '{sheetName}' ({maxCol} columns)");
+            _dirty = true;
+            return "true";
         }
 
         // ──────────────────────────────────────────────
@@ -890,13 +880,16 @@ namespace AIOrchestrator.API
         /// <param name="sheetName">Worksheet name (from GetSheetNames()).</param>
         /// <param name="rowIndex">0-based row index.</param>
         /// <param name="heightInPoints">Row height in points. Use -1 to reset to default.</param>
-        /// <returns>True if the row height was set.</returns>
-        public bool SetRowHeight(string sheetName, int rowIndex, double heightInPoints)
+        /// <returns>"true", or "Error: …" if the row height was set.</returns>
+        public string SetRowHeight(string sheetName, int rowIndex, double heightInPoints)
         {
             var ws = FindSheet(sheetName);
-            if (ws == null) return false;
+            if (ws == null) return $"Error: worksheet '{sheetName}' not found";
+            if (rowIndex < 0 || rowIndex > 1_048_575) return $"Error: row index {rowIndex} out of range (0..1048575)";
             ws.Cells.Rows[rowIndex].Height = heightInPoints >= 0 ? heightInPoints : null;
-            return true;
+            Log.LogStep($"SpreadsheetTool.SetRowHeight: '{sheetName}' row={rowIndex} height={heightInPoints}");
+            _dirty = true;
+            return "true";
         }
 
         /// <summary>
@@ -904,13 +897,16 @@ namespace AIOrchestrator.API
         /// </summary>
         /// <param name="sheetName">Worksheet name (from GetSheetNames()).</param>
         /// <param name="rowIndex">0-based row index.</param>
-        /// <returns>True if the row was hidden.</returns>
-        public bool HideRow(string sheetName, int rowIndex)
+        /// <returns>"true", or "Error: …" if the row was hidden.</returns>
+        public string HideRow(string sheetName, int rowIndex)
         {
             var ws = FindSheet(sheetName);
-            if (ws == null) return false;
+            if (ws == null) return $"Error: worksheet '{sheetName}' not found";
+            if (rowIndex < 0 || rowIndex > 1_048_575) return $"Error: row index {rowIndex} out of range (0..1048575)";
             ws.Cells.Rows[rowIndex].IsHidden = true;
-            return true;
+            Log.LogStep($"SpreadsheetTool.HideRow: '{sheetName}' row={rowIndex}");
+            _dirty = true;
+            return "true";
         }
 
         /// <summary>
@@ -918,13 +914,16 @@ namespace AIOrchestrator.API
         /// </summary>
         /// <param name="sheetName">Worksheet name (from GetSheetNames()).</param>
         /// <param name="rowIndex">0-based row index.</param>
-        /// <returns>True if the row was unhidden.</returns>
-        public bool UnhideRow(string sheetName, int rowIndex)
+        /// <returns>"true", or "Error: …" if the row was unhidden.</returns>
+        public string UnhideRow(string sheetName, int rowIndex)
         {
             var ws = FindSheet(sheetName);
-            if (ws == null) return false;
+            if (ws == null) return $"Error: worksheet '{sheetName}' not found";
+            if (rowIndex < 0 || rowIndex > 1_048_575) return $"Error: row index {rowIndex} out of range (0..1048575)";
             ws.Cells.Rows[rowIndex].IsHidden = false;
-            return true;
+            Log.LogStep($"SpreadsheetTool.UnhideRow: '{sheetName}' row={rowIndex}");
+            _dirty = true;
+            return "true";
         }
 
         /// <summary>
@@ -934,13 +933,16 @@ namespace AIOrchestrator.API
         /// <param name="sheetName">Worksheet name (from GetSheetNames()).</param>
         /// <param name="columnIndex">0-based column index.</param>
         /// <param name="widthInCharacters">Column width in character units.</param>
-        /// <returns>True if the column width was set.</returns>
-        public bool SetColumnWidth(string sheetName, int columnIndex, double widthInCharacters)
+        /// <returns>"true", or "Error: …" if the column width was set.</returns>
+        public string SetColumnWidth(string sheetName, int columnIndex, double widthInCharacters)
         {
             var ws = FindSheet(sheetName);
-            if (ws == null) return false;
+            if (ws == null) return $"Error: worksheet '{sheetName}' not found";
+            if (columnIndex < 0 || columnIndex > 16_383) return $"Error: column index {columnIndex} out of range (0..16383)";
             ws.Cells.Columns[columnIndex].Width = widthInCharacters;
-            return true;
+            Log.LogStep($"SpreadsheetTool.SetColumnWidth: '{sheetName}' col={columnIndex} width={widthInCharacters}");
+            _dirty = true;
+            return "true";
         }
 
         /// <summary>
@@ -948,13 +950,16 @@ namespace AIOrchestrator.API
         /// </summary>
         /// <param name="sheetName">Worksheet name (from GetSheetNames()).</param>
         /// <param name="columnIndex">0-based column index.</param>
-        /// <returns>True if the column was hidden.</returns>
-        public bool HideColumn(string sheetName, int columnIndex)
+        /// <returns>"true", or "Error: …" if the column was hidden.</returns>
+        public string HideColumn(string sheetName, int columnIndex)
         {
             var ws = FindSheet(sheetName);
-            if (ws == null) return false;
+            if (ws == null) return $"Error: worksheet '{sheetName}' not found";
+            if (columnIndex < 0 || columnIndex > 16_383) return $"Error: column index {columnIndex} out of range (0..16383)";
             ws.Cells.Columns[columnIndex].IsHidden = true;
-            return true;
+            Log.LogStep($"SpreadsheetTool.HideColumn: '{sheetName}' col={columnIndex}");
+            _dirty = true;
+            return "true";
         }
 
         /// <summary>
@@ -962,13 +967,16 @@ namespace AIOrchestrator.API
         /// </summary>
         /// <param name="sheetName">Worksheet name (from GetSheetNames()).</param>
         /// <param name="columnIndex">0-based column index.</param>
-        /// <returns>True if the column was unhidden.</returns>
-        public bool UnhideColumn(string sheetName, int columnIndex)
+        /// <returns>"true", or "Error: …" if the column was unhidden.</returns>
+        public string UnhideColumn(string sheetName, int columnIndex)
         {
             var ws = FindSheet(sheetName);
-            if (ws == null) return false;
+            if (ws == null) return $"Error: worksheet '{sheetName}' not found";
+            if (columnIndex < 0 || columnIndex > 16_383) return $"Error: column index {columnIndex} out of range (0..16383)";
             ws.Cells.Columns[columnIndex].IsHidden = false;
-            return true;
+            Log.LogStep($"SpreadsheetTool.UnhideColumn: '{sheetName}' col={columnIndex}");
+            _dirty = true;
+            return "true";
         }
 
         // ──────────────────────────────────────────────
@@ -976,11 +984,14 @@ namespace AIOrchestrator.API
         // ──────────────────────────────────────────────
 
         /// <summary>
-        /// Adds a new chart to a worksheet and returns its index.
+        /// Adds a new chart to a worksheet and returns its index as a string.
         /// The chart is placed in the specified cell-anchored rectangle.
-        /// The data range is normalized (sheet name defaulted to the target sheet, "$" removed)
-        /// and the chart data is populated deterministically (series + cached values), so the
-        /// chart renders with data even in apps that do not refresh caches on open.
+        /// The data range is normalized (sheet name defaulted to the target sheet, "$" removed).
+        /// Data convention: with a 2D block (several rows AND columns) the first row holds the
+        /// series names, the first column holds the category labels, and every other column
+        /// becomes a series — the classic matrix layout. A 1D range (one row or one column)
+        /// becomes a single series without categories. The chart is saved with its data
+        /// embedded, so it renders even in apps that do not refresh chart data on open.
         /// </summary>
         /// <param name="sheetName">Worksheet name (from GetSheetNames()).</param>
         /// <param name="chartType">Chart type: "Column", "Bar", "Line", "Pie", "Area", "Scatter", "Doughnut", "Radar", etc.</param>
@@ -989,20 +1000,36 @@ namespace AIOrchestrator.API
         /// <param name="upperLeftColumn">Zero-based column for upper-left anchor.</param>
         /// <param name="lowerRightRow">Zero-based row for lower-right anchor.</param>
         /// <param name="lowerRightColumn">Zero-based column for lower-right anchor.</param>
-        /// <returns>The zero-based chart index, or -1 on failure.</returns>
-        public int AddChart(string sheetName, string chartType, string dataRange,
+        /// <returns>The zero-based chart index as a string (e.g. "0"), or "Error: …" on failure.</returns>
+        public string AddChart(string sheetName, string chartType, string dataRange,
             int upperLeftRow, int upperLeftColumn, int lowerRightRow, int lowerRightColumn)
         {
             var ws = FindSheet(sheetName);
-            if (ws == null) return -1;
+            if (ws == null) return $"Error: worksheet '{sheetName}' not found";
             var type = ParseChartType(chartType);
+            if (type == null)
+                return $"Error: unknown chart type '{chartType}' (valid: Column, Bar, Line, Pie, Area, Scatter, Doughnut, Radar, Stock, 3D variants)";
+            if (string.IsNullOrWhiteSpace(dataRange)) return "Error: a data range is required";
+            if (upperLeftRow < 0 || upperLeftColumn < 0 || lowerRightRow < upperLeftRow || lowerRightColumn < upperLeftColumn
+                || lowerRightRow > 1_048_575 || lowerRightColumn > 16_383)
+                return "Error: invalid anchor rectangle (zero-based, ordered rows/columns within the sheet)";
+
             var range = NormalizeChartRange(dataRange, ws.Name);
-            var idx = ws.Charts.Add(type, range, upperLeftRow, upperLeftColumn, lowerRightRow, lowerRightColumn);
-            // The FOSS chart template saves an EMPTY numCache (ptCount=0), which renders as a
-            // blank chart in LibreOffice/Excel. The cache is populated deterministically at save
-            // time (PatchChartCaches) from the referenced cells, so the chart always shows data.
-            Log.LogStep($"SpreadsheetTool.AddChart: '{sheetName}' {chartType} (index {idx}) range='{range}'");
-            return idx;
+            var cellsPart = range[(range.LastIndexOf('!') + 1)..];
+            var p = TryParseRange(cellsPart);
+            if (!p.Ok) return $"Error: {p.Error}";
+
+            try
+            {
+                var idx = ws.Charts.Add(type.Value, range, upperLeftRow, upperLeftColumn, lowerRightRow, lowerRightColumn);
+                _dirty = true;
+                Log.LogStep($"SpreadsheetTool.AddChart: '{sheetName}' {chartType} (index {idx}) range='{range}'");
+                return idx.ToString();
+            }
+            catch (Exception ex)
+            {
+                return $"Error: {ex.Message}";
+            }
         }
 
         /// <summary>
@@ -1024,19 +1051,9 @@ namespace AIOrchestrator.API
         }
 
         /// <summary>
-        /// Returns the number of charts on a worksheet.
-        /// </summary>
-        /// <param name="sheetName">Worksheet name (from GetSheetNames()).</param>
-        /// <returns>Chart count, or -1 if sheet not found.</returns>
-        public int GetChartsCount(string sheetName)
-        {
-            var ws = FindSheet(sheetName);
-            return ws?.Charts.Count ?? -1;
-        }
-
-        /// <summary>
         /// Returns summary info about all charts on a worksheet as a 2D array.
         /// Columns: Index, Name, Type, Position.
+        /// The chart count is GetChartsInfo().Length - 1 (the first row is the header).
         /// </summary>
         /// <param name="sheetName">Worksheet name (from GetSheetNames()).</param>
         /// <returns>2D string array with chart info, or null if sheet not found.</returns>
@@ -1071,13 +1088,18 @@ namespace AIOrchestrator.API
         /// <param name="totalRows">Number of rows the hyperlink spans.</param>
         /// <param name="totalColumns">Number of columns the hyperlink spans.</param>
         /// <param name="address">URL, file path, or email address.</param>
-        /// <returns>True if the hyperlink was added.</returns>
-        public bool AddHyperlink(string sheetName, string cellName, int totalRows, int totalColumns, string address)
+        /// <returns>"true", or "Error: …" when the sheet/cell is invalid.</returns>
+        public string AddHyperlink(string sheetName, string cellName, int totalRows, int totalColumns, string address)
         {
             var ws = FindSheet(sheetName);
-            if (ws == null) return false;
+            if (ws == null) return $"Error: worksheet '{sheetName}' not found";
+            var p = TryParseCellRef(cellName);
+            if (!p.Ok) return $"Error: {p.Error}";
+            if (totalRows < 1 || totalColumns < 1) return "Error: totalRows and totalColumns must be at least 1";
             ws.Hyperlinks.Add(cellName, totalRows, totalColumns, address);
-            return true;
+            Log.LogStep($"SpreadsheetTool.AddHyperlink: '{sheetName}'!{cellName} → {address}");
+            _dirty = true;
+            return "true";
         }
 
         /// <summary>
@@ -1104,13 +1126,16 @@ namespace AIOrchestrator.API
         /// </summary>
         /// <param name="sheetName">Worksheet name (from GetSheetNames()).</param>
         /// <param name="index">Zero-based hyperlink index (from GetHyperlinks()).</param>
-        /// <returns>True if removed.</returns>
-        public bool RemoveHyperlink(string sheetName, int index)
+        /// <returns>"true", or "Error: …" when the sheet or the index is invalid.</returns>
+        public string RemoveHyperlink(string sheetName, int index)
         {
             var ws = FindSheet(sheetName);
-            if (ws == null) return false;
+            if (ws == null) return $"Error: worksheet '{sheetName}' not found";
+            if (index < 0 || index >= ws.Hyperlinks.Count) return $"Error: hyperlink index {index} out of range (0..{ws.Hyperlinks.Count - 1})";
             ws.Hyperlinks.RemoveAt(index);
-            return true;
+            Log.LogStep($"SpreadsheetTool.RemoveHyperlink: '{sheetName}' index={index}");
+            _dirty = true;
+            return "true";
         }
 
         // ──────────────────────────────────────────────
@@ -1124,15 +1149,18 @@ namespace AIOrchestrator.API
         /// <param name="cellReference">Cell reference in A1 notation (e.g. "A1").</param>
         /// <param name="text">Comment text.</param>
         /// <param name="author">Optional author name.</param>
-        /// <returns>True if the comment was added.</returns>
-        public bool AddComment(string sheetName, string cellReference, string text, string? author = null)
+        /// <returns>"true", or "Error: …" when the sheet or the cell reference is invalid.</returns>
+        public string AddComment(string sheetName, string cellReference, string text, string? author = null)
         {
             var ws = FindSheet(sheetName);
-            if (ws == null) return false;
+            if (ws == null) return $"Error: worksheet '{sheetName}' not found";
+            if (!TryParseCellRef(cellReference).Ok) return $"Error: invalid cell reference '{cellReference}'";
             var comment = ws.Comments.Add(cellReference);
             comment.Note = text;
             if (!string.IsNullOrEmpty(author)) comment.Author = author;
-            return true;
+            Log.LogStep($"SpreadsheetTool.AddComment: '{sheetName}'!{cellReference}");
+            _dirty = true;
+            return "true";
         }
 
         /// <summary>
@@ -1178,13 +1206,16 @@ namespace AIOrchestrator.API
         /// </summary>
         /// <param name="sheetName">Worksheet name (from GetSheetNames()).</param>
         /// <param name="cellReference">Cell reference (e.g. "A1").</param>
-        /// <returns>True if removed.</returns>
-        public bool RemoveComment(string sheetName, string cellReference)
+        /// <returns>"true", or "Error: …" when the sheet or the cell reference is invalid.</returns>
+        public string RemoveComment(string sheetName, string cellReference)
         {
             var ws = FindSheet(sheetName);
-            if (ws == null) return false;
+            if (ws == null) return $"Error: worksheet '{sheetName}' not found";
+            if (!TryParseCellRef(cellReference).Ok) return $"Error: invalid cell reference '{cellReference}'";
             ws.Comments.RemoveAt(cellReference);
-            return true;
+            Log.LogStep($"SpreadsheetTool.RemoveComment: '{sheetName}'!{cellReference}");
+            _dirty = true;
+            return "true";
         }
 
         // ──────────────────────────────────────────────
@@ -1201,14 +1232,26 @@ namespace AIOrchestrator.API
         /// <param name="upperLeftColumn">Zero-based column for upper-left anchor.</param>
         /// <param name="lowerRightRow">Zero-based row for lower-right anchor.</param>
         /// <param name="lowerRightColumn">Zero-based column for lower-right anchor.</param>
-        /// <returns>True if the picture was added.</returns>
-        public bool AddPicture(string sheetName, string imageFilePath,
+        /// <returns>"true", or "Error: …" when the sheet or the parameters are invalid.</returns>
+        public string AddPicture(string sheetName, string imageFilePath,
             int upperLeftRow, int upperLeftColumn, int lowerRightRow, int lowerRightColumn)
         {
             var ws = FindSheet(sheetName);
-            if (ws == null) return false;
-            ws.Pictures.Add(upperLeftRow, upperLeftColumn, lowerRightRow, lowerRightColumn, imageFilePath);
-            return true;
+            if (ws == null) return $"Error: worksheet '{sheetName}' not found";
+            if (string.IsNullOrWhiteSpace(imageFilePath)) return "Error: an image file path is required";
+            if (upperLeftRow < 0 || upperLeftColumn < 0 || lowerRightRow < upperLeftRow || lowerRightColumn < upperLeftColumn)
+                return "Error: invalid anchor rectangle (zero-based, ordered rows/columns)";
+            try
+            {
+                ws.Pictures.Add(upperLeftRow, upperLeftColumn, lowerRightRow, lowerRightColumn, imageFilePath);
+                Log.LogStep($"SpreadsheetTool.AddPicture: '{sheetName}' {imageFilePath}");
+                _dirty = true;
+                return "true";
+            }
+            catch (Exception ex)
+            {
+                return $"Error: {ex.Message}";
+            }
         }
 
         /// <summary>
@@ -1216,13 +1259,16 @@ namespace AIOrchestrator.API
         /// </summary>
         /// <param name="sheetName">Worksheet name (from GetSheetNames()).</param>
         /// <param name="index">Zero-based picture index (0 to GetPicturesCount()-1).</param>
-        /// <returns>True if removed.</returns>
-        public bool RemovePicture(string sheetName, int index)
+        /// <returns>"true", or "Error: …" when the sheet or the index is invalid.</returns>
+        public string RemovePicture(string sheetName, int index)
         {
             var ws = FindSheet(sheetName);
-            if (ws == null) return false;
+            if (ws == null) return $"Error: worksheet '{sheetName}' not found";
+            if (index < 0 || index >= ws.Pictures.Count) return $"Error: picture index {index} out of range (0..{ws.Pictures.Count - 1})";
             ws.Pictures.RemoveAt(index);
-            return true;
+            Log.LogStep($"SpreadsheetTool.RemovePicture: '{sheetName}' index={index}");
+            _dirty = true;
+            return "true";
         }
 
         /// <summary>
@@ -1244,14 +1290,20 @@ namespace AIOrchestrator.API
         /// <param name="startCell">Top-left cell as a SEPARATE parameter, e.g. "A1" — not a combined range like "A1:D10".</param>
         /// <param name="endCell">Bottom-right cell as a SEPARATE parameter, e.g. "D55".</param>
         /// <param name="hasHeaders">True if the first row contains column headers.</param>
-        /// <returns>True if the table was added.</returns>
-        public bool AddTable(string sheetName, string startCell, string endCell, bool hasHeaders = true)
+        /// <returns>"true", or "Error: …" when the sheet or the range is invalid.</returns>
+        public string AddTable(string sheetName, string startCell, string endCell, bool hasHeaders = true)
         {
             var ws = FindSheet(sheetName);
-            if (ws == null) return false;
+            if (ws == null) return $"Error: worksheet '{sheetName}' not found";
+            var a = TryParseCellRef(startCell);
+            var b = TryParseCellRef(endCell);
+            if (!a.Ok) return $"Error: {a.Error}";
+            if (!b.Ok) return $"Error: {b.Error}";
+            if (a.Row > b.Row || a.Col > b.Col) return "Error: startCell must be the top-left corner (start <= end)";
             ws.ListObjects.Add(startCell, endCell, hasHeaders);
             Log.LogStep($"SpreadsheetTool.AddTable: '{sheetName}'!{startCell}:{endCell}");
-            return true;
+            _dirty = true;
+            return "true";
         }
 
         /// <summary>
@@ -1285,13 +1337,16 @@ namespace AIOrchestrator.API
         /// </summary>
         /// <param name="sheetName">Worksheet name (from GetSheetNames()).</param>
         /// <param name="index">Zero-based table index (from GetTables()).</param>
-        /// <returns>True if removed.</returns>
-        public bool RemoveTable(string sheetName, int index)
+        /// <returns>"true", or "Error: …" when the sheet or the index is invalid.</returns>
+        public string RemoveTable(string sheetName, int index)
         {
             var ws = FindSheet(sheetName);
-            if (ws == null) return false;
+            if (ws == null) return $"Error: worksheet '{sheetName}' not found";
+            if (index < 0 || index >= ws.ListObjects.Count) return $"Error: table index {index} out of range (0..{ws.ListObjects.Count - 1})";
             ws.ListObjects.RemoveAt(index);
-            return true;
+            Log.LogStep($"SpreadsheetTool.RemoveTable: '{sheetName}' index={index}");
+            _dirty = true;
+            return "true";
         }
 
         // ──────────────────────────────────────────────
@@ -1303,29 +1358,32 @@ namespace AIOrchestrator.API
         /// </summary>
         /// <param name="sheetName">Worksheet name (from GetSheetNames()).</param>
         /// <param name="range">Range in A1 notation (e.g. "A1:C10").</param>
-        /// <returns>True if the AutoFilter was set.</returns>
-        public bool SetAutoFilter(string sheetName, string range)
+        /// <returns>"true", or "Error: …" when the sheet or the range is invalid.</returns>
+        public string SetAutoFilter(string sheetName, string range)
         {
             var ws = FindSheet(sheetName);
-            if (ws == null) return false;
-            var (startRef, endRef) = ParseRange(range);
-            var (startRow, startCol) = ParseCellRef(startRef);
-            var (endRow, endCol) = ParseCellRef(endRef);
+            if (ws == null) return $"Error: worksheet '{sheetName}' not found";
+            var p = TryParseRange(range);
+            if (!p.Ok) return $"Error: {p.Error}";
             ws.AutoFilter.Range = range;
-            return true;
+            Log.LogStep($"SpreadsheetTool.SetAutoFilter: '{sheetName}'!{range}");
+            _dirty = true;
+            return "true";
         }
 
         /// <summary>
         /// Removes the AutoFilter from a worksheet.
         /// </summary>
         /// <param name="sheetName">Worksheet name (from GetSheetNames()).</param>
-        /// <returns>True if the AutoFilter was removed.</returns>
-        public bool RemoveAutoFilter(string sheetName)
+        /// <returns>"true", or "Error: …" if the AutoFilter was removed.</returns>
+        public string RemoveAutoFilter(string sheetName)
         {
             var ws = FindSheet(sheetName);
-            if (ws == null) return false;
+            if (ws == null) return $"Error: worksheet '{sheetName}' not found";
             ws.AutoFilter.Clear();
-            return true;
+            Log.LogStep($"SpreadsheetTool.RemoveAutoFilter: '{sheetName}'");
+            _dirty = true;
+            return "true";
         }
 
         // ──────────────────────────────────────────────
@@ -1341,16 +1399,18 @@ namespace AIOrchestrator.API
         /// <param name="name">Variable name (e.g. "TaxRate", "SalesData"). Must be unique.</param>
         /// <param name="formula">Formula or reference the name points to (e.g. "=0.22", "=Sheet1!$A$1:$C$100").</param>
         /// <param name="localSheetName">Optional: if set, the name is scoped to this sheet only (from GetSheetNames()).</param>
-        /// <returns>True if the defined name was added.</returns>
-        public bool AddDefinedName(string name, string formula, string? localSheetName = null)
+        /// <returns>"true", or "Error: …" when the name/sheet is invalid or already taken.</returns>
+        public string AddDefinedName(string name, string formula, string? localSheetName = null)
         {
+            if (string.IsNullOrWhiteSpace(name)) return "Error: a defined name is required";
+            if (string.IsNullOrWhiteSpace(formula)) return "Error: a formula is required";
             try
             {
                 int? sheetIndex = null;
                 if (!string.IsNullOrEmpty(localSheetName))
                 {
                     var ws = FindSheet(localSheetName);
-                    if (ws == null) return false;
+                    if (ws == null) return $"Error: worksheet '{localSheetName}' not found";
                     // Find the sheet index
                     for (int i = 0; i < _workbook.Worksheets.Count; i++)
                     {
@@ -1359,10 +1419,14 @@ namespace AIOrchestrator.API
                     }
                 }
                 _workbook.DefinedNames.Add(name, formula, sheetIndex);
+                _dirty = true;
                 Log.LogStep($"SpreadsheetTool.AddDefinedName: '{name}' = {formula}");
-                return true;
+                return "true";
             }
-            catch { return false; }
+            catch (Exception ex)
+            {
+                return $"Error: {ex.Message}";
+            }
         }
 
         /// <summary>
@@ -1421,8 +1485,8 @@ namespace AIOrchestrator.API
         /// Removes a defined name by its name.
         /// </summary>
         /// <param name="name">The defined name to remove (from GetDefinedNames()).</param>
-        /// <returns>True if removed.</returns>
-        public bool RemoveDefinedName(string name)
+        /// <returns>"true", or "Error: …" when the name does not exist.</returns>
+        public string RemoveDefinedName(string name)
         {
             try
             {
@@ -1431,12 +1495,17 @@ namespace AIOrchestrator.API
                     if (_workbook.DefinedNames[i].Name == name)
                     {
                         _workbook.DefinedNames.RemoveAt(i);
-                        return true;
+                        Log.LogStep($"SpreadsheetTool.RemoveDefinedName: '{name}'");
+                        _dirty = true;
+                        return "true";
                     }
                 }
-                return false;
+                return $"Error: defined name '{name}' not found";
             }
-            catch { return false; }
+            catch (Exception ex)
+            {
+                return $"Error: {ex.Message}";
+            }
         }
 
         // ──────────────────────────────────────────────
@@ -1458,14 +1527,14 @@ namespace AIOrchestrator.API
         /// <param name="printArea">Print area range (e.g. "A1:C10"). Null to keep current.</param>
         /// <param name="centerHorizontally">True to center horizontally on page.</param>
         /// <param name="centerVertically">True to center vertically on page.</param>
-        /// <returns>True if settings were applied.</returns>
-        public bool SetPageSetup(string sheetName,
+        /// <returns>"true", or "Error: …" if settings were applied.</returns>
+        public string SetPageSetup(string sheetName,
             string? orientation = null, string? paperSize = null,
             int? scale = null, int? fitToPagesWide = null, int? fitToPagesTall = null,
             string? printArea = null, bool? centerHorizontally = null, bool? centerVertically = null)
         {
             var ws = FindSheet(sheetName);
-            if (ws == null) return false;
+            if (ws == null) return $"Error: worksheet '{sheetName}' not found";
             var ps = ws.PageSetup;
 
             if (!string.IsNullOrEmpty(orientation))
@@ -1482,7 +1551,9 @@ namespace AIOrchestrator.API
             if (centerHorizontally.HasValue) ps.CenterHorizontally = centerHorizontally.Value;
             if (centerVertically.HasValue) ps.CenterVertically = centerVertically.Value;
 
-            return true;
+            Log.LogStep($"SpreadsheetTool.SetPageSetup: '{sheetName}'");
+            _dirty = true;
+            return "true";
         }
 
         /// <summary>
@@ -1531,25 +1602,23 @@ namespace AIOrchestrator.API
         /// <param name="fontColorHex">Font color "#RRGGBB" when condition is met.</param>
         /// <param name="fillColorHex">Fill color "#RRGGBB" when condition is met.</param>
         /// <param name="bold">True for bold when condition is met.</param>
-        /// <returns>True if the conditional format was added.</returns>
-        public bool AddConditionalFormat(string sheetName, string range,
+        /// <returns>"true", or "Error: …" when the sheet or the range is invalid.</returns>
+        public string AddConditionalFormat(string sheetName, string range,
             string conditionType, string? operatorType = null,
             string? formula1 = null, string? formula2 = null,
             string? fontColorHex = null, string? fillColorHex = null, bool? bold = null)
         {
             var ws = FindSheet(sheetName);
-            if (ws == null) return false;
-
-            var (startRef, endRef) = ParseRange(range);
-            var (startRow, startCol) = ParseCellRef(startRef);
-            var (endRow, endCol) = ParseCellRef(endRef);
+            if (ws == null) return $"Error: worksheet '{sheetName}' not found";
+            var p = TryParseRange(range);
+            if (!p.Ok) return $"Error: {p.Error}";
 
             var area = new CellArea
             {
-                StartRow = startRow,
-                StartColumn = startCol,
-                EndRow = endRow,
-                EndColumn = endCol
+                StartRow = p.R1,
+                StartColumn = p.C1,
+                EndRow = p.R2,
+                EndColumn = p.C2
             };
 
             var condType = ParseFormatConditionType(conditionType);
@@ -1570,7 +1639,8 @@ namespace AIOrchestrator.API
             }
 
             Log.LogStep($"SpreadsheetTool.AddConditionalFormat: '{sheetName}'!{range} ({conditionType})");
-            return true;
+            _dirty = true;
+            return "true";
         }
 
         // ──────────────────────────────────────────────
@@ -1600,7 +1670,7 @@ namespace AIOrchestrator.API
 
             var result = new Dictionary<string, object?>
             {
-                ["filePath"] = _filePath,
+                ["filePath"] = SandboxPath.ToAgent(_filePath),
                 ["sheets"] = new List<object>()
             };
 
@@ -1975,6 +2045,60 @@ namespace AIOrchestrator.API
             ws.Cells.Columns[col].Width = Math.Clamp(maxLen + 2.0, 8.0, 60.0);
         }
 
+        /// <summary>Writes the in-memory workbook to <paramref name="targetPath"/> through a temp
+        /// file, patches the chart caches, and commits the file ONLY when every XML part parses
+        /// (the same bar Excel/LibreOffice apply on open). The target file is never replaced by
+        /// an unvalidated package. Returns null on success, else the validation/save error.</summary>
+        private string? PersistValidated(string targetPath)
+        {
+            var tmp = targetPath + ".validating";
+            try
+            {
+                _workbook!.Save(tmp);
+                PatchChartCaches(tmp);
+                var validationError = ValidateXmlParts(tmp);
+                if (validationError != null)
+                    return validationError;
+                File.Copy(tmp, targetPath, overwrite: true);
+                return null;
+            }
+            catch (Exception ex)
+            {
+                return ex.Message;
+            }
+            finally
+            {
+                try { if (File.Exists(tmp)) File.Delete(tmp); } catch { }
+            }
+        }
+
+        /// <summary>Strict well-formedness check of every XML part in a saved workbook package.
+        /// The serializer writes valid XML by construction, but the chart cache patch rewrites
+        /// parts — this gate guarantees the file on disk always opens in Excel/LibreOffice.</summary>
+        private static string? ValidateXmlParts(string filePath)
+        {
+            try
+            {
+                using var zip = ZipFile.OpenRead(filePath);
+                foreach (var e in zip.Entries)
+                {
+                    if (!e.Name.EndsWith(".xml", StringComparison.OrdinalIgnoreCase)) continue;
+                    using var s = e.Open();
+                    var doc = new System.Xml.XmlDocument();
+                    try { doc.Load(s); }
+                    catch (System.Xml.XmlException ex)
+                    {
+                        return $"invalid XML in '{e.FullName}': {ex.Message}";
+                    }
+                }
+                return null;
+            }
+            catch (Exception ex)
+            {
+                return $"cannot validate '{filePath}': {ex.Message}";
+            }
+        }
+
         /// <summary>Populates the chart numCache entries of a saved workbook: the FOSS chart
         /// template always writes an EMPTY cache (ptCount=0), which renders as a blank chart in
         /// LibreOffice/Excel. The values are read from the referenced cells and written into the
@@ -2025,14 +2149,54 @@ namespace AIOrchestrator.API
             }
         }
 
+        // The closing </c:numCache> is part of the match so the whole element is replaced
+        // atomically: a replacement ending at <c:ptCount val="0"/> left the original
+        // </c:numCache></c:numRef> tail behind, producing a duplicate closing tag and a
+        // malformed chart XML that Excel/LibreOffice refuse to render.
         private static readonly System.Text.RegularExpressions.Regex ChartCachePattern = new(
-            @"<c:f>(?<range>[^<]+)</c:f>\s*<c:numCache><c:formatCode>[^<]*</c:formatCode><c:ptCount val=""0""/>",
+            @"<c:f>(?<range>[^<]+)</c:f>\s*<c:numCache><c:formatCode>[^<]*</c:formatCode><c:ptCount val=""0""/></c:numCache>",
             System.Text.RegularExpressions.RegexOptions.Compiled);
 
-        /// <summary>Replaces every empty chart numCache with the actual values of the range
-        /// referenced by the preceding &lt;c:f&gt;. Unchanged (empty) when no numeric value is found.</summary>
+        /// <summary>The fork's single-series template, verbatim: used to detect charts we created
+        /// (one &lt;c:ser&gt; with only a val and an empty numCache) so preserved charts loaded
+        /// from existing files are never restructured.</summary>
+        private static readonly System.Text.RegularExpressions.Regex ChartSeriesPattern = new(
+            @"<c:ser><c:idx val=""0""/><c:order val=""0""/><c:val><c:numRef><c:f>(?<range>[^<]+)</c:f><c:numCache><c:formatCode>[^<]*</c:formatCode><c:ptCount val=""0""/></c:numCache></c:numRef></c:val></c:ser>",
+            System.Text.RegularExpressions.RegexOptions.Compiled);
+
+        /// <summary>Chart families whose series carry &lt;c:cat&gt; + &lt;c:val&gt; (bar/line/area/
+        /// pie/doughnut/radar, incl. 3D). Scatter/bubble/stock/surface use different series
+        /// layouts and only get their caches filled.</summary>
+        private static readonly System.Text.RegularExpressions.Regex ChartFamilyPattern = new(
+            @"<c:(bar|line|area|pie|doughnut|radar)[A-Za-z0-9]*Chart>",
+            System.Text.RegularExpressions.RegexOptions.Compiled);
+
+        /// <summary>Populates the empty caches of every chart in a saved workbook. Charts we
+        /// created from the fork template get restructured: a 2D data block becomes one series
+        /// per column with the first row as series names and the first column as categories
+        /// (a 1D range stays a single series); all numCache/strCache values are filled from the
+        /// referenced cells — deterministic, no app-side refresh needed.</summary>
         private string PopulateChartCacheXml(string xml)
         {
+            if (ChartFamilyPattern.IsMatch(xml))
+            {
+                try
+                {
+                    var restructured = ChartSeriesPattern.Replace(xml, m =>
+                    {
+                        var series = BuildSeriesXml(m.Groups["range"].Value);
+                        return series ?? m.Value;
+                    });
+                    if (restructured != xml) return restructured;
+                }
+                catch
+                {
+                    // fall through to the cache-only fill below
+                }
+            }
+
+            // Cache-only path: the remaining families (scatter/bubble/stock/…) and preserved
+            // charts whose empty cache was not restructured above still need their values.
             return ChartCachePattern.Replace(xml, m =>
             {
                 var pts = BuildChartPointsXml(m.Groups["range"].Value);
@@ -2040,6 +2204,118 @@ namespace AIOrchestrator.API
                     ? $"<c:f>{m.Groups["range"].Value}</c:f><c:numCache><c:formatCode>General</c:formatCode>{pts}</c:numCache>"
                     : m.Value;
             });
+        }
+
+        /// <summary>Builds the &lt;c:ser&gt; block(s) for a chart range. 2D block → categories
+        /// (first column, below the header row) + one series per remaining column with the name
+        /// from the header row; 1D range → a single series. Returns null when no numeric value
+        /// can be read (chart stays as-is).</summary>
+        private string? BuildSeriesXml(string range)
+        {
+            var bang = range.LastIndexOf('!');
+            var sheetName = bang >= 0 ? range[..bang].Trim().Trim('\'') : null;
+            var cells = (bang >= 0 ? range[(bang + 1)..] : range).Replace("$", "");
+            var ws = sheetName == null ? _workbook!.Worksheets[0] : FindSheet(sheetName);
+            if (ws == null) return null;
+            var p = TryParseRange(cells);
+            if (!p.Ok) return null;
+            var r1 = p.R1; var c1 = p.C1;
+            var r2 = Math.Min(p.R2, r1 + 1000);
+            var c2 = Math.Min(p.C2, c1 + 100);
+            var sheetRef = "'" + (sheetName ?? "").Replace("'", "''") + "'";
+
+            bool isMatrix = (r2 - r1 + 1) >= 2 && (c2 - c1 + 1) >= 2;
+            int serCount = isMatrix ? c2 - c1 : 1;   // first column becomes the categories
+
+            var sb = new System.Text.StringBuilder();
+            for (int i = 0; i < serCount; i++)
+            {
+                int sCol = isMatrix ? c1 + 1 + i : c1;
+                sb.Append("<c:ser><c:idx val=\"").Append(i).Append("\"/><c:order val=\"").Append(i).Append("\"/>");
+
+                if (isMatrix)
+                {
+                    // Series name from the header row of the series column.
+                    var name = ws.Cells[r1, sCol]?.StringValue ?? "";
+                    var nameRef = $"{sheetRef}!${ColLetter(sCol)}${r1 + 1}";
+                    sb.Append("<c:tx><c:strRef><c:f>").Append(nameRef).Append("</c:f>")
+                      .Append("<c:strCache><c:ptCount val=\"1\"/><c:pt idx=\"0\"><c:v>")
+                      .Append(EscapeXml(name)).Append("</c:v></c:pt></c:strCache></c:strRef></c:tx>");
+
+                    // Categories from the first column, rows below the header row.
+                    var catPts = BuildTextPointsXml(ws, r1 + 1, c1, r2, c1);
+                    if (catPts == null) return null;
+                    var catRef = $"{sheetRef}!${ColLetter(c1)}${r1 + 2}:${ColLetter(c1)}${r2 + 1}";
+                    sb.Append("<c:cat><c:strRef><c:f>").Append(catRef).Append("</c:f><c:strCache>")
+                      .Append(catPts).Append("</c:strCache></c:strRef></c:cat>");
+                }
+
+                var numPts = isMatrix
+                    ? BuildNumberPointsXml(ws, r1 + 1, sCol, r2, sCol)
+                    : BuildNumberPointsXml(ws, r1, c1, r2, c2);
+                if (numPts == null) return null;
+                var valRef = isMatrix
+                    ? $"{sheetRef}!${ColLetter(sCol)}${r1 + 2}:${ColLetter(sCol)}${r2 + 1}"
+                    : $"{sheetRef}!${ColLetter(c1)}${r1 + 1}:${ColLetter(c2)}${r2 + 1}";
+                sb.Append("<c:val><c:numRef><c:f>").Append(valRef).Append("</c:f>")
+                  .Append("<c:numCache><c:formatCode>General</c:formatCode>").Append(numPts)
+                  .Append("</c:numCache></c:numRef></c:val></c:ser>");
+            }
+            return sb.ToString();
+        }
+
+        /// <summary>Renders the &lt;c:ptCount&gt; + &lt;c:pt&gt; rows of a strCache for a cell range.</summary>
+        private static string? BuildTextPointsXml(Worksheet ws, int r1, int c1, int r2, int c2)
+        {
+            var sb = new System.Text.StringBuilder();
+            int n = 0;
+            for (int r = r1; r <= r2; r++)
+                for (int c = c1; c <= c2; c++)
+                {
+                    var s = ws.Cells[r, c]?.StringValue ?? "";
+                    sb.Append("<c:pt idx=\"").Append(n).Append("\"><c:v>").Append(EscapeXml(s)).Append("</c:v></c:pt>");
+                    n++;
+                }
+            if (n == 0) return null;
+            return $"<c:ptCount val=\"{n}\"/>{sb}";
+        }
+
+        /// <summary>Renders the &lt;c:ptCount&gt; + &lt;c:pt&gt; rows of a numCache for a cell range,
+        /// keeping only cells that hold numbers. Values are read from the boxed <c>Cell.Value</c>
+        /// (never from display strings, which are style/culture dependent). Formula cells without
+        /// a cached value are skipped.</summary>
+        private static string? BuildNumberPointsXml(Worksheet ws, int r1, int c1, int r2, int c2)
+        {
+            var sb = new System.Text.StringBuilder();
+            int n = 0;
+            for (int r = r1; r <= r2; r++)
+                for (int c = c1; c <= c2; c++)
+                {
+                    if (!TryFormatNumber(ws.Cells[r, c]?.Value, out var num)) continue;
+                    sb.Append("<c:pt idx=\"").Append(n).Append("\"><c:v>")
+                      .Append(num).Append("</c:v></c:pt>");
+                    n++;
+                }
+            if (n == 0) return null;
+            return $"<c:ptCount val=\"{n}\"/>{sb}";
+        }
+
+        /// <summary>Formats a boxed cell value as an invariant number string, or returns false
+        /// for non-numeric values (text, booleans, DateTime, formula cells without a cached
+        /// value).</summary>
+        private static bool TryFormatNumber(object? value, out string number)
+        {
+            switch (value)
+            {
+                case byte b: number = b.ToString(CultureInfo.InvariantCulture); return true;
+                case short s: number = s.ToString(CultureInfo.InvariantCulture); return true;
+                case int i: number = i.ToString(CultureInfo.InvariantCulture); return true;
+                case long l: number = l.ToString(CultureInfo.InvariantCulture); return true;
+                case float f: number = f.ToString(CultureInfo.InvariantCulture); return true;
+                case double d: number = d.ToString(CultureInfo.InvariantCulture); return true;
+                case decimal m: number = m.ToString(CultureInfo.InvariantCulture); return true;
+                default: number = string.Empty; return false;
+            }
         }
 
         /// <summary>Reads the numeric values of a chart range (sheet!A1:B5) and renders the
@@ -2053,21 +2329,18 @@ namespace AIOrchestrator.API
                 var cells = (bang >= 0 ? range[(bang + 1)..] : range).Replace("$", "");
                 var ws = sheetName == null ? _workbook!.Worksheets[0] : FindSheet(sheetName);
                 if (ws == null) return null;
-                var (startRef, endRef) = ParseRange(cells);
-                var (r1, c1) = ParseCellRef(startRef);
-                var (r2, c2) = ParseCellRef(endRef);
-                r2 = Math.Min(r2, r1 + 1000);
-                c2 = Math.Min(c2, c1 + 100);
+                var p = TryParseRange(cells);
+                if (!p.Ok) return null;
+                var r1 = p.R1; var c1 = p.C1;
+                var r2 = Math.Min(p.R2, r1 + 1000);
+                var c2 = Math.Min(p.C2, c1 + 100);
 
                 var vals = new List<string>();
                 for (int r = r1; r <= r2; r++)
                     for (int c = c1; c <= c2; c++)
                     {
-                        var cell = ws.Cells[r, c];
-                        var s = cell?.StringValue;
-                        if (string.IsNullOrEmpty(s)) continue;
-                        if (double.TryParse(s, NumberStyles.Any, CultureInfo.InvariantCulture, out var d))
-                            vals.Add(d.ToString(CultureInfo.InvariantCulture));
+                        if (!TryFormatNumber(ws.Cells[r, c]?.Value, out var num)) continue;
+                        vals.Add(num);
                     }
                 if (vals.Count == 0) return null;
 
@@ -2092,44 +2365,76 @@ namespace AIOrchestrator.API
             return null;
         }
 
-        private static List<Cell?> ResolveCells(Worksheet ws, string cellOrRange)
+        /// <summary>Guards the "A1" or "A1:C5" cellOrRange parameter shared by the style methods.
+        /// Returns null when valid, else the error message.</summary>
+        private static string? ValidateCellOrRange(string cellOrRange)
         {
-            var cells = new List<Cell?>();
-
             if (cellOrRange.Contains(':'))
-            {
-                var parts = cellOrRange.Split(':');
-                var (startRow, startCol) = ParseCellRef(parts[0]);
-                var (endRow, endCol) = ParseCellRef(parts[1]);
-
-                for (int r = startRow; r <= endRow; r++)
-                    for (int c = startCol; c <= endCol; c++)
-                        cells.Add(ws.Cells[r, c]);
-            }
-            else
-            {
-                cells.Add(ws.Cells[cellOrRange]);
-            }
-
-            return cells;
+                return TryParseRange(cellOrRange).Ok ? null : TryParseRange(cellOrRange).Error;
+            var p = TryParseCellRef(cellOrRange);
+            return p.Ok ? null : p.Error;
         }
 
-        private static (int Row, int Col) ParseCellRef(string refStr)
+        /// <summary>Strict A1-reference parser used as a guard at every public entry point.
+        /// Returns an error message instead of throwing, so the agent gets certain feedback
+        /// on the exact parameter that was rejected.</summary>
+        private static (bool Ok, int Row, int Col, string Error) TryParseCellRef(string refStr)
         {
+            if (string.IsNullOrEmpty(refStr)) return (false, 0, 0, $"invalid cell reference '{refStr}'");
             int col = 0, i = 0;
             while (i < refStr.Length && char.IsLetter(refStr[i]))
             {
                 col = col * 26 + (char.ToUpper(refStr[i]) - 'A' + 1);
                 i++;
             }
-            int row = int.Parse(refStr.AsSpan(i)) - 1;
-            return (row, col - 1);
+            if (i == 0 || i >= refStr.Length || !int.TryParse(refStr.AsSpan(i), out var row)
+                || row < 1 || row > 1_048_576 || col < 1 || col > 16_384)
+                return (false, 0, 0, $"invalid cell reference '{refStr}'");
+            return (true, row - 1, col - 1, "");
         }
 
-        private static (string Start, string End) ParseRange(string range)
+        /// <summary>Strict "A1:C5" range parser (single cell allowed). Validates order and caps the
+        /// area so a bad agent parameter can never trigger an unbounded operation.</summary>
+        private static (bool Ok, int R1, int C1, int R2, int C2, string Error) TryParseRange(string range)
         {
+            if (string.IsNullOrEmpty(range)) return (false, 0, 0, 0, 0, $"invalid range '{range}'");
             var parts = range.Split(':');
-            return (parts[0], parts.Length > 1 ? parts[1] : parts[0]);
+            if (parts.Length > 2) return (false, 0, 0, 0, 0, $"invalid range '{range}'");
+            var a = TryParseCellRef(parts[0]);
+            if (!a.Ok) return (false, 0, 0, 0, 0, a.Error);
+            var b = TryParseCellRef(parts.Length == 2 ? parts[1] : parts[0]);
+            if (!b.Ok) return (false, 0, 0, 0, 0, b.Error);
+            var r1 = Math.Min(a.Row, b.Row); var c1 = Math.Min(a.Col, b.Col);
+            var r2 = Math.Max(a.Row, b.Row); var c2 = Math.Max(a.Col, b.Col);
+            long area = (long)(r2 - r1 + 1) * (c2 - c1 + 1);
+            if (area > MaxCellArea) return (false, 0, 0, 0, 0, $"range '{range}' too large ({area} cells, max {MaxCellArea})");
+            return (true, r1, c1, r2, c2, "");
+        }
+
+        /// <summary>Escapes a value for insertion into chart XML (&lt;c:v&gt; text).</summary>
+        private static string EscapeXml(string s) =>
+            s.Replace("&", "&amp;").Replace("<", "&lt;").Replace(">", "&gt;");
+
+        /// <summary>0-based index of the last row carrying a value OR a formula (formula-only
+        /// cells display as empty without recalculation, so a display-only scan would stop early
+        /// and a later append would overwrite formula rows). Scans all columns, capped like
+        /// ScanNonEmptyColumns. Returns -1 for an empty sheet.</summary>
+        private static int FindLastUsedRow(Worksheet ws)
+        {
+            int lastUsedRow = -1;
+            for (int r = 0; r < 5000; r++)
+            {
+                bool any = false;
+                for (int c = 0; c < 500; c++)
+                {
+                    var cell = ws.Cells[r, c];
+                    if (cell != null && (!string.IsNullOrEmpty(cell.DisplayStringValue) || !string.IsNullOrEmpty(cell.Formula)))
+                    { any = true; break; }
+                }
+                if (any) lastUsedRow = r;
+                else if (r > lastUsedRow + 5) break; // 5 empty rows → stop
+            }
+            return lastUsedRow;
         }
 
         private static void SetCellValueAuto(Cell cell, string value)
@@ -2150,17 +2455,36 @@ namespace AIOrchestrator.API
             }
 
             if (bool.TryParse(value, out var bVal)) { cell.PutValue(bVal); return; }
-            if (int.TryParse(value, System.Globalization.NumberStyles.Any,
-                System.Globalization.CultureInfo.InvariantCulture, out var iVal))
-            { cell.PutValue(iVal); return; }
-            if (decimal.TryParse(value, System.Globalization.NumberStyles.Any,
-                System.Globalization.CultureInfo.InvariantCulture, out var dVal))
-            { cell.PutValue(dVal); return; }
-            if (DateTime.TryParse(value, System.Globalization.CultureInfo.InvariantCulture,
-                System.Globalization.DateTimeStyles.None, out var dtVal))
-            { cell.PutValue(dtVal); return; }
+            // Numbers and dates must not silently become text when written in the user's locale
+            // ("1,5" decimal comma, "15/01/2026" dd/MM/yyyy): text cells are excluded from
+            // formulas and from chart data, so an Italian-locale value would corrupt both.
+            if (TryParseNumber(value, out var dVal)) { cell.PutValue(dVal); return; }
+            if (TryParseDate(value, out var dtVal)) { cell.PutValue(dtVal); return; }
 
             cell.PutValue(value);
+        }
+
+        /// <summary>Deterministic decimal parsing: the LAST separator decides the culture.
+        /// Comma last → European decimal comma ("1,5", "1.234,56" → it-IT); dot last →
+        /// invariant ("1.5", "1,234.56"). Never ambiguous, both locale conventions work.</summary>
+        private static bool TryParseNumber(string value, out decimal result)
+        {
+            var styles = System.Globalization.NumberStyles.Number;
+            var lastDot = value.LastIndexOf('.');
+            var lastComma = value.LastIndexOf(',');
+            var culture = lastComma > lastDot
+                ? System.Globalization.CultureInfo.GetCultureInfo("it-IT")
+                : System.Globalization.CultureInfo.InvariantCulture;
+            return decimal.TryParse(value, styles, culture, out result);
+        }
+
+        private static bool TryParseDate(string value, out DateTime result)
+        {
+            if (DateTime.TryParse(value, System.Globalization.CultureInfo.InvariantCulture,
+                System.Globalization.DateTimeStyles.None, out result)) return true;
+            if (DateTime.TryParse(value, System.Globalization.CultureInfo.GetCultureInfo("it-IT"),
+                System.Globalization.DateTimeStyles.None, out result)) return true;
+            return false;
         }
 
         private static Color ParseColor(string hex)
@@ -2237,7 +2561,7 @@ namespace AIOrchestrator.API
             };
         }
 
-        private static ChartType ParseChartType(string value)
+        private static ChartType? ParseChartType(string value)
         {
             return value.ToLowerInvariant() switch
             {
@@ -2262,7 +2586,7 @@ namespace AIOrchestrator.API
                 "histogram" => ChartType.Histogram,
                 "funnel" => ChartType.Funnel,
                 "map" => ChartType.Map,
-                _ => ChartType.Column,
+                _ => null,
             };
         }
 

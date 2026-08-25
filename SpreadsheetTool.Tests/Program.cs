@@ -87,6 +87,11 @@ static class Program
         Setup.SkipIndexingOnStartup = true;
         Setup.DocumentsPath = workspace;
 
+        // Register the tool BEFORE the agent loop: McpToolRegistry resolves tool names by
+        // scanning the loaded assemblies, and a referenced assembly loads lazily — without
+        // this the catalog is empty and the agent invents method names.
+        McpToolRegistry.Register(typeof(SpreadsheetTool));
+
         var orch = new AgentHarness(providerName);
         try
         {
@@ -164,7 +169,7 @@ static class Program
         using var ss = new SpreadsheetTool();
 
         Console.WriteLine("Workbook structure:");
-        if (!ss.Open(filePath))
+        if (ss.Open(filePath) != "true")
         {
             issues.Add("SpreadsheetTool.Open failed on the produced file");
             return issues;
@@ -229,7 +234,7 @@ static class Program
         Setup.SkipIndexingOnStartup = true;
         Setup.DocumentsPath = Path.GetDirectoryName(Path.GetFullPath(filePath)) ?? AppContext.BaseDirectory;
         using var ss = new SpreadsheetTool();
-        if (!ss.Open(filePath))
+        if (ss.Open(filePath) != "true")
         {
             Console.WriteLine($"✗ cannot open '{filePath}'");
             return 1;
@@ -272,6 +277,7 @@ static class Program
         Setup.SkipIndexingOnStartup = true;
         Setup.DocumentsPath = dir;
 
+        var guardFail = false;
         using (var ss = new SpreadsheetTool())
         {
             ss.Create("/charttest.xlsx");
@@ -281,26 +287,77 @@ static class Program
                 new[]{"Feb","150","250","350"},
                 new[]{"Mar","180","280","380"},
             });
+            // 2D block (4x4) → 3 series (Torino/Milano/Bologna) with categories Gen/Feb/Mar.
             var i1 = ss.AddChart("Sheet1", "Column", "Sheet1!$F$1:$I$4", 2, 6, 15, 20);
-            var i2 = ss.AddChart("Sheet1", "Pie", "G2:I4", 17, 6, 30, 20); // no $, no sheet name
+            // 2 columns → 1 series (Torino) with categories Gen/Feb/Mar (labels + values).
+            var i2 = ss.AddChart("Sheet1", "Pie", "F1:G4", 17, 6, 30, 20);
             Console.WriteLine($"AddChart (anchored, normalized range): {i1}, {i2}");
             foreach (var info in ss.GetChartsInfo("Sheet1").Skip(1))
                 Console.WriteLine($"  chart {info[0]}: {info[2]} at {info[3]}");
+
+            // Guards: invalid parameters must return "error: …" (never throw, never a bare "false").
+            var g1 = ss.SetRange("Sheet1", "A0", new[] { new[] { "x" } });
+            var g2 = ss.AddChart("Sheet1", "Piee", "F1:G4", 0, 0, 5, 5);
+            var g3 = ss.SetCellValue("Nope", "A1", "x");
+            var g4 = ss.SetRange("Sheet1", "A1", new[] { new[] { "1", "2" }, new[] { "3" } });
+            // Ragged block with a null row: must not throw (null row skipped, wider row auto-fitted).
+            var g5 = ss.SetRange("Sheet1", "B6", new[] { new[] { "1", "2" }, null, new[] { "3", "4", "5" } });
+            Console.WriteLine($"guards: SetRange(A0)='{g1}', AddChart(Piee)='{g2}', SetCellValue(Nope)='{g3}', SetRange(huge)='{g4}', SetRange(ragged+null)='{g5}'");
+            guardFail = !g1.StartsWith("Error:") || !g2.StartsWith("Error:") || !g3.StartsWith("Error:") || g4.StartsWith("Error:") || g5.StartsWith("Error:");
+            if (guardFail) Console.WriteLine("  ✗ a guard returned something other than 'error: …' on invalid input");
         }
 
         var file = Path.Combine(dir, "charttest.xlsx");
-        var ok = true;
+        var ok = guardFail == false;
         using (var zip = System.IO.Compression.ZipFile.OpenRead(file))
         {
-            foreach (var entry in zip.Entries.Where(e => e.FullName.StartsWith("xl/charts/") && e.FullName.EndsWith(".xml")))
+            var chartEntries = zip.Entries.Where(e => e.FullName.StartsWith("xl/charts/") && e.FullName.EndsWith(".xml")).ToList();
+            if (chartEntries.Count != 2)
+            { ok = false; Console.WriteLine($"  ✗ expected 2 chart parts, found {chartEntries.Count}"); }
+
+            foreach (var entry in chartEntries)
             {
                 using var sr = new StreamReader(entry.Open());
                 var xml = sr.ReadToEnd();
+
+                // Well-formedness is the SAME bar Excel/LibreOffice apply on open: a malformed
+                // chart part is a blank chart even when the caches look populated.
+                var doc = new System.Xml.XmlDocument();
+                try { doc.LoadXml(xml); }
+                catch (System.Xml.XmlException ex)
+                { ok = false; Console.WriteLine($"  ✗ {entry.FullName} is NOT well-formed: {ex.Message}"); }
+
+                var sers = System.Text.RegularExpressions.Regex.Matches(xml, "<c:ser>").Count;
+                var cats = System.Text.RegularExpressions.Regex.Matches(xml, "<c:cat>").Count;
                 var cached = System.Text.RegularExpressions.Regex.Matches(xml, "<c:v>").Count;
                 var pt = System.Text.RegularExpressions.Regex.Match(xml, "<c:ptCount val=\"(\\d+)\"").Groups[1].Value;
-                Console.WriteLine($"{entry.FullName}: cached <c:v>={cached}, ptCount={pt}");
+                Console.WriteLine($"{entry.FullName}: series={sers}, categories={cats}, <c:v>={cached}, ptCount={pt}");
                 if (cached == 0) { ok = false; Console.WriteLine("  ✗ chart cache EMPTY — would render blank in LibreOffice"); }
             }
+
+            // chart1 (Column, 4x4 matrix) must be restructured: 3 series + 3 categories.
+            var chart1 = zip.GetEntry("xl/charts/chart1.xml");
+            if (chart1 != null)
+            {
+                using var sr = new StreamReader(chart1.Open());
+                var xml = sr.ReadToEnd();
+                var sers = System.Text.RegularExpressions.Regex.Matches(xml, "<c:ser>").Count;
+                var cats = System.Text.RegularExpressions.Regex.Matches(xml, "<c:cat>").Count;
+                if (sers != 3) { ok = false; Console.WriteLine($"  ✗ chart1: expected 3 series (matrix 4x4), found {sers}"); }
+                if (cats != 3) { ok = false; Console.WriteLine($"  ✗ chart1: expected 3 categories, found {cats}"); }
+            }
+            // chart2 (Pie, 2 columns) → 1 series with 1 category set.
+            var chart2 = zip.GetEntry("xl/charts/chart2.xml");
+            if (chart2 != null)
+            {
+                using var sr = new StreamReader(chart2.Open());
+                var xml = sr.ReadToEnd();
+                var sers = System.Text.RegularExpressions.Regex.Matches(xml, "<c:ser>").Count;
+                var cats = System.Text.RegularExpressions.Regex.Matches(xml, "<c:cat>").Count;
+                if (sers != 1) { ok = false; Console.WriteLine($"  ✗ chart2: expected 1 series (2-column range), found {sers}"); }
+                if (cats != 1) { ok = false; Console.WriteLine($"  ✗ chart2: expected 1 category set, found {cats}"); }
+            }
+
             var sheetXml = zip.GetEntry("xl/worksheets/sheet1.xml");
             if (sheetXml != null)
             {
@@ -311,7 +368,7 @@ static class Program
                 if (cols.Count == 0) { ok = false; Console.WriteLine("  ✗ no column widths written"); }
             }
         }
-        Console.WriteLine(ok ? "\n✓ chart caches populated + fresh columns auto-fitted" : "\n✗ deterministic assists failed");
+        Console.WriteLine(ok ? "\n✓ chart caches populated + series restructured + XML well-formed" : "\n✗ deterministic assists failed");
         return ok ? 0 : 1;
     }
 
