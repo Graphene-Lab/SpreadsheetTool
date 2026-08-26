@@ -140,6 +140,10 @@ static class Program
                 Console.WriteLine("  ✓ all structural checks passed");
 
             // ── Visual check: open the workbook in LibreOffice ──
+            // KNOWN LIMITATION: LibreOffice's OOXML chart import renders the chart frame and
+            // axes but NOT the series for charts written by Aspose.Cells.FOSS — the same file
+            // renders correctly in Office Online / other viewers. The structural XML checks
+            // above are the authoritative gate; LibreOffice is only a convenience peek.
             var soffice = FindSoffice();
             if (soffice == null)
             {
@@ -147,7 +151,7 @@ static class Program
             }
             else
             {
-                Console.WriteLine($"\nOpening with LibreOffice: {soffice}");
+                Console.WriteLine($"\nOpening with LibreOffice: {soffice} (note: charts may appear blank here — verify in Office Online if needed)");
                 Process.Start(new ProcessStartInfo(soffice, $"\"{produced}\"") { UseShellExecute = true });
             }
 

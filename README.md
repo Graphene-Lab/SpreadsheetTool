@@ -38,6 +38,14 @@ from it.
 every `master` push (`.github/workflows/publish.yml`, `NUGET_API_KEY` repo secret).
 Local pack pushes with the `NuGetApiKey` env var; skip with `-p:SkipNuGetPush=true`.
 
+## Notes
+
+- **Charts** are written as standard OOXML with the data embedded (series, categories
+  and cached values), so they render in Excel, Office Online and other spreadsheet
+  viewers without any recalculation. Known limitation: **LibreOffice** may render the
+  chart frame and axes but not the series for these charts (an import/rendering quirk
+  of LibreOffice itself — the same files render correctly elsewhere).
+
 ## License
 
 See [LICENSE.md](LICENSE.md).
