@@ -306,16 +306,20 @@ static class Program
                 Console.WriteLine($"  chart {info[0]}: {info[2]} at {info[3]}");
 
             // Guards: invalid parameters must return "error: …" (never throw, never a bare "false").
+            // Write methods now return AREA RECEIPTS (objects) on success, strings on error.
             var g1 = ss.SetRange("Sheet1", "A0", new[] { new[] { "x" } });
             var g2 = ss.AddChart("Sheet1", "Piee", "F1:G4", 0, 0, 5, 5);
             var g3 = ss.SetCellValue("Nope", "A1", "x");
             var g4 = ss.SetRange("Sheet1", "A1", new[] { new[] { "1", "2" }, new[] { "3" } });
             // Ragged block with a null row: must not throw (null row skipped, wider row auto-fitted).
             var g5 = ss.SetRange("Sheet1", "B6", new[] { new[] { "1", "2" }, null, new[] { "3", "4", "5" } });
-            Console.WriteLine($"guards: SetRange(A0)='{g1}', AddChart(Piee)='{g2}', SetCellValue(Nope)='{g3}', SetRange(huge)='{g4}', SetRange(ragged+null)='{g5}'");
-            guardFail = !g1.StartsWith("Error:") || !g2.StartsWith("Error:") || !g3.StartsWith("Error:") || g4.StartsWith("Error:") || g5.StartsWith("Error:");
+            Console.WriteLine($"guards: SetRange(A0)='{Desc(g1)}', AddChart(Piee)='{Desc(g2)}', SetCellValue(Nope)='{Desc(g3)}', SetRange(huge)='{Desc(g4)}', SetRange(ragged+null)='{Desc(g5)}'");
+            guardFail = !IsError(g1) || !IsError(g2) || !IsError(g3) || IsError(g4) || IsError(g5);
             if (guardFail) Console.WriteLine("  ✗ a guard returned something other than 'error: …' on invalid input");
         }
+
+        static bool IsError(object? r) => r?.ToString()?.StartsWith("Error:") == true;
+        static string Desc(object? r) => r is string s ? s : System.Text.Json.JsonSerializer.Serialize(r);
 
         var file = Path.Combine(dir, "charttest.xlsx");
         var ok = guardFail == false;
@@ -399,6 +403,7 @@ static class Program
         Directory.CreateDirectory(dir);
         Setup.SkipIndexingOnStartup = true;
         Setup.DocumentsPath = dir;
+        var ok = true;   // shared by the in-memory receipt checks and the file-based checks below
 
         using (var ss = new SpreadsheetTool())
         {
@@ -428,12 +433,41 @@ static class Program
             // User-set width on column E: must be preserved by the auto-format pass.
             ss.SetColumnWidth("Sheet1", 4, 20);
             ss.SetCellValue("Sheet1", "E2", "wide user column");
+
+            // GetRange(detailed) + write receipts (the agent feedback mechanism).
+            var det = ss.GetRange("Sheet1", "A1", "D5", detailed: true);
+            Console.WriteLine("  GetRange detailed: " + System.Text.Json.JsonSerializer.Serialize(det));
+            if (det is not Dictionary<string, object?> d
+                || (string)d["sheet"] != "Sheet1" || (string)d["range"] != "A1:D5"
+                || (int)d["rows"] != 5 || (int)d["columns"] != 4)
+            { ok = false; Console.WriteLine("  ✗ GetRange detailed → sheet + A1 range + dimensions"); }
+            if (det is Dictionary<string, object?> d2
+                && (!d2.TryGetValue("formulas", out var f) || f is not Dictionary<string, object> fm || fm.Count < 3))
+            { ok = false; Console.WriteLine("  ✗ GetRange detailed → formulas sparse (D3:D5)"); }
+            if (det is Dictionary<string, object?> d3
+                && (!d3.TryGetValue("formats", out var ft0) || ft0 is not Dictionary<string, object> ft || ft.Count < 3))
+            { ok = false; Console.WriteLine("  ✗ GetRange detailed → formats sparse ($#,##0.00)"); }
+            if (det is Dictionary<string, object?> d4
+                && (!d4.TryGetValue("types", out var ty0) || ty0 is not Dictionary<string, object> ty || ty.Count < 4))
+            { ok = false; Console.WriteLine("  ✗ GetRange detailed → types sparse (text headers)"); }
+            // Sparse negative: a plain numeric range (no formulas/formats/types) must NOT carry
+            // any of the optional sections.
+            var detPlain = ss.GetRange("Sheet1", "A3", "A5", detailed: true);
+            if (detPlain is Dictionary<string, object?> dp && (dp.ContainsKey("formulas") || dp.ContainsKey("formats") || dp.ContainsKey("types")))
+            { ok = false; Console.WriteLine("  ✗ GetRange detailed → sparse violated (empty sections present)"); }
+            // Write receipt: SetRange returns the modified area (range + values).
+            var rcpt = ss.SetRange("Sheet1", "Z1", new[] { new[] { "a", "b" } });
+            Console.WriteLine("  SetRange receipt: " + System.Text.Json.JsonSerializer.Serialize(rcpt));
+            if (rcpt is not Dictionary<string, object?> r2
+                || (string)r2["range"] != "Z1:AA1"
+                || r2["values"] is not System.Collections.IList vl || vl.Count != 1)
+            { ok = false; Console.WriteLine("  ✗ SetRange → area receipt (range + values)"); }
+
             Console.WriteLine("  scenario: Create + SetRange + ApplyStyle + FormatHeaderRow + SetColumnWidth → Save");
             Console.WriteLine($"  Save: {ss.Save()}");
         }
 
         var file = Path.Combine(dir, "autofmt.xlsx");
-        var ok = true;
         using (var zip = System.IO.Compression.ZipFile.OpenRead(file))
         {
             var sheet = ReadEntry(zip, "xl/worksheets/sheet1.xml");

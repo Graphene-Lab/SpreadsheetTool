@@ -409,8 +409,10 @@ namespace AIOrchestrator.API
         /// <param name="sheetName">Worksheet name (case-sensitive, from GetSheetNames()).</param>
         /// <param name="cellReference">Cell reference in A1 notation (e.g. "A1", "C5").</param>
         /// <param name="value">The value to write. Parsed automatically.</param>
-        /// <returns>"true", or "Error: …" when the sheet or the cell reference is invalid.</returns>
-        public string SetCellValue(string sheetName, string cellReference, string value)
+        /// <returns>The area receipt for the written cell — sheet name, exact cell reference and
+        /// the stored value (feedback for the agent to verify its own work), or "Error: …" when
+        /// the sheet or the cell reference is invalid.</returns>
+        public object SetCellValue(string sheetName, string cellReference, string value)
         {
             var ws = FindSheet(sheetName);
             if (ws == null) return $"Error: worksheet '{sheetName}' not found";
@@ -420,7 +422,7 @@ namespace AIOrchestrator.API
             SetCellValueAuto(ws.Cells[cellReference], value);
             _dirty = true;
             Log.LogStep($"SpreadsheetTool.SetCellValue: '{sheetName}'!{cellReference} = '{value}'");
-            return "true";
+            return DescribeArea(ws, p.Row, p.Col, p.Row, p.Col);
         }
 
         /// <summary>
@@ -446,8 +448,9 @@ namespace AIOrchestrator.API
         /// <param name="sheetName">Worksheet name (case-sensitive, from GetSheetNames()).</param>
         /// <param name="cellReference">Cell reference in A1 notation (e.g. "A1").</param>
         /// <param name="formula">Formula including the leading '=' (e.g. "=SUM(B2:B10)").</param>
-        /// <returns>"true", or "Error: …" when the sheet or the cell reference is invalid.</returns>
-        public string SetCellFormula(string sheetName, string cellReference, string formula)
+        /// <returns>The area receipt for the written cell (sheet, cell reference, formula —
+        /// feedback for the agent to verify its own work), or "Error: …" on invalid input.</returns>
+        public object SetCellFormula(string sheetName, string cellReference, string formula)
         {
             var ws = FindSheet(sheetName);
             if (ws == null) return $"Error: worksheet '{sheetName}' not found";
@@ -459,7 +462,7 @@ namespace AIOrchestrator.API
             cell.Formula = formula;
             Log.LogStep($"SpreadsheetTool.SetCellFormula: '{sheetName}'!{cellReference} = {formula}");
             _dirty = true;
-            return "true";
+            return DescribeArea(ws, p.Row, p.Col, p.Row, p.Col);
         }
 
         /// <summary>
@@ -522,8 +525,14 @@ namespace AIOrchestrator.API
         /// <param name="sheetName">Worksheet name (case-sensitive, from GetSheetNames()).</param>
         /// <param name="startCell">Top-left cell (e.g. "A1").</param>
         /// <param name="endCell">Bottom-right cell (e.g. "C10").</param>
-        /// <returns>2D string array [row][col], or null if the sheet is not found.</returns>
-        public string[][]? GetRange(string sheetName, string startCell, string endCell)
+        /// <param name="detailed">When true, returns an enriched JSON object instead of the raw 2D
+        /// array: the sheet name and the exact A1 range (position on the page), plus SPARSE
+        /// "formulas"/"types"/"formats" objects that list ONLY the cells carrying that information
+        /// (cells not listed in "types" are numeric) — so the agent gets a verifiable, compact
+        /// picture of the area as feedback/memory for its work.</param>
+        /// <returns>2D string array [row][col] (or the enriched object with detailed=true),
+        /// or null if the sheet is not found.</returns>
+        public object? GetRange(string sheetName, string startCell, string endCell, bool detailed = false)
         {
             var ws = FindSheet(sheetName);
             if (ws == null) return null;
@@ -533,6 +542,9 @@ namespace AIOrchestrator.API
 
             var (startRow, startCol) = (Math.Min(a.Row, b.Row), Math.Min(a.Col, b.Col));
             var (endRow, endCol) = (Math.Max(a.Row, b.Row), Math.Max(a.Col, b.Col));
+
+            if (detailed)
+                return DescribeArea(ws, startRow, startCol, endRow, endCol);
 
             int rows = endRow - startRow + 1;
             int cols = endCol - startCol + 1;
@@ -550,6 +562,58 @@ namespace AIOrchestrator.API
             return result;
         }
 
+        /// <summary>Builds the compact, SPARSE JSON representation of a rectangular area: sheet
+        /// name + exact A1 range (position on the page) + dimensions + display values; the
+        /// "formulas"/"types"/"formats" objects include ONLY the cells that carry that information
+        /// (empty sections are omitted entirely — no null/empty fields — to keep the token cost
+        /// low). Cells not listed in "types" are numeric. Used by GetRange(detailed=true) and by
+        /// every write method as the feedback/receipt of what was modified.</summary>
+        private Dictionary<string, object?> DescribeArea(Worksheet ws, int startRow, int startCol, int endRow, int endCol)
+        {
+            var values = new List<object[]>();
+            var formulas = new Dictionary<string, object>();
+            var types = new Dictionary<string, object>();
+            var formats = new Dictionary<string, object>();
+            for (int r = startRow; r <= endRow; r++)
+            {
+                var row = new List<object>();
+                for (int c = startCol; c <= endCol; c++)
+                {
+                    var cell = ws.Cells[r, c];
+                    row.Add(cell?.DisplayStringValue ?? "");
+                    if (cell == null) continue;
+                    var refName = CellRefFromIdx(r, c);
+                    if (!string.IsNullOrEmpty(cell.Formula))
+                        formulas[refName] = cell.Formula.StartsWith('=') ? cell.Formula : "=" + cell.Formula;
+                    else if (cell.Type is CellValueType.IsString or CellValueType.IsDateTime
+                        or CellValueType.IsBool or CellValueType.IsError)
+                        types[refName] = cell.Type switch
+                        {
+                            CellValueType.IsString => "text",
+                            CellValueType.IsDateTime => "date",
+                            CellValueType.IsBool => "bool",
+                            _ => "error",
+                        };
+                    var custom = cell.GetStyle().Custom;
+                    if (!string.IsNullOrEmpty(custom))
+                        formats[refName] = custom;
+                }
+                values.Add(row.ToArray());
+            }
+            var result = new Dictionary<string, object?>
+            {
+                ["sheet"] = ws.Name,
+                ["range"] = $"{CellRefFromIdx(startRow, startCol)}:{CellRefFromIdx(endRow, endCol)}",
+                ["rows"] = endRow - startRow + 1,
+                ["columns"] = endCol - startCol + 1,
+                ["values"] = values,
+            };
+            if (formulas.Count > 0) result["formulas"] = formulas;
+            if (types.Count > 0) result["types"] = types;
+            if (formats.Count > 0) result["formats"] = formats;
+            return result;
+        }
+
         /// <summary>
         /// Writes a 2D string array starting at the specified cell.
         /// Auto-detects number, boolean, date, and string values.
@@ -557,9 +621,11 @@ namespace AIOrchestrator.API
         /// <param name="sheetName">Worksheet name (case-sensitive, from GetSheetNames()).</param>
         /// <param name="startCell">Top-left cell (e.g. "A1").</param>
         /// <param name="values">2D array of STRINGS [row][col]; pass numbers as strings (e.g. "14500") — the tool auto-detects and stores them as numbers. Rows may have different lengths.</param>
-        /// <returns>"true", or "Error: …" when the sheet/cell reference is invalid or the block
-        /// is too large (nothing is written on error).</returns>
-        public string SetRange(string sheetName, string startCell, string[][] values)
+        /// <returns>The area receipt for the written block (sheet, exact A1 range, dimensions,
+        /// values, formulas/types/formats when present — feedback for the agent to verify its own
+        /// work), or "Error: …" when the sheet/cell reference is invalid or the block is too
+        /// large (nothing is written on error).</returns>
+        public object SetRange(string sheetName, string startCell, string[][] values)
         {
             var ws = FindSheet(sheetName);
             if (ws == null) return $"Error: worksheet '{sheetName}' not found";
@@ -594,7 +660,7 @@ namespace AIOrchestrator.API
 
             _dirty = true;
             Log.LogStep($"SpreadsheetTool.SetRange: '{sheetName}'!{startCell} ({values.Length} rows)");
-            return "true";
+            return DescribeArea(ws, startRow, startCol, startRow + values.Length - 1, startCol + maxCols - 1);
         }
 
         /// <summary>
@@ -604,9 +670,10 @@ namespace AIOrchestrator.API
         /// </summary>
         /// <param name="sheetName">Worksheet name (case-sensitive, from GetSheetNames()).</param>
         /// <param name="rows">Array of rows to append.</param>
-        /// <returns>"true", or "Error: …" when the sheet is missing or the block is too large
-        /// (nothing is written on error).</returns>
-        public string AppendRows(string sheetName, string[][] rows)
+        /// <returns>The area receipt for the appended block (sheet, exact A1 range, dimensions,
+        /// values — feedback for the agent to verify its own work), or "Error: …" when the sheet
+        /// is missing or the block is too large (nothing is written on error).</returns>
+        public object AppendRows(string sheetName, string[][] rows)
         {
             var ws = FindSheet(sheetName);
             if (ws == null) return $"Error: worksheet '{sheetName}' not found";
@@ -640,7 +707,7 @@ namespace AIOrchestrator.API
 
             _dirty = true;
             Log.LogStep($"SpreadsheetTool.AppendRows: '{sheetName}' ({rows.Length} rows from row {startRow})");
-            return "true";
+            return DescribeArea(ws, startRow, 0, startRow + rows.Length - 1, maxCols - 1);
         }
 
         // ──────────────────────────────────────────────
@@ -696,8 +763,9 @@ namespace AIOrchestrator.API
         /// <param name="borderStyle">Border line style (e.g. "Thin"). Only applied when set.</param>
         /// <param name="borderSide">Which sides to border (default "All").</param>
         /// <param name="borderColorHex">Border color "#RRGGBB" (default black).</param>
-        /// <returns>"true", or "Error: …" if the style was applied.</returns>
-        public string ApplyStyle(string sheetName, string cellOrRange,
+        /// <returns>The style receipt — sheet, styled range and the list of parameters actually
+        /// applied (feedback for the agent to verify its own work), or "Error: …" on invalid input.</returns>
+        public object ApplyStyle(string sheetName, string cellOrRange,
             string? fontName = null, double fontSize = 0,
             bool? bold = null, bool? italic = null,
             string? fontColorHex = null, string? fillColorHex = null,
@@ -795,9 +863,29 @@ namespace AIOrchestrator.API
                     cell.SetStyle(style);
                 }
             }
+
+            var applied = new List<object>();
+            if (!string.IsNullOrEmpty(fontName)) applied.Add("font '" + fontName + "'");
+            if (fontSize > 0) applied.Add("fontSize " + fontSize);
+            if (bold.HasValue) applied.Add("bold=" + bold.Value.ToString().ToLowerInvariant());
+            if (italic.HasValue) applied.Add("italic=" + italic.Value.ToString().ToLowerInvariant());
+            if (!string.IsNullOrEmpty(fontColorHex)) applied.Add("fontColor " + fontColorHex);
+            if (!string.IsNullOrEmpty(fillColorHex))
+                applied.Add(fillColorHex.Equals("none", StringComparison.OrdinalIgnoreCase) ? "fill none" : "fill " + fillColorHex);
+            if (!string.IsNullOrEmpty(horizontalAlignment)) applied.Add("hAlign " + horizontalAlignment);
+            if (!string.IsNullOrEmpty(verticalAlignment)) applied.Add("vAlign " + verticalAlignment);
+            if (wrapText.HasValue) applied.Add("wrapText=" + wrapText.Value.ToString().ToLowerInvariant());
+            if (!string.IsNullOrEmpty(numberFormat)) applied.Add("numberFormat '" + NormalizeNumberFormat(numberFormat) + "'");
+            if (border.HasValue) applied.Add("border " + borderStyle + (borderSide != null && borderSide != "All" ? " (" + borderSide + ")" : ""));
+
             Log.LogStep($"SpreadsheetTool.ApplyStyle: '{sheetName}'!{cellOrRange}");
             _dirty = true;
-            return "true";
+            return new Dictionary<string, object?>
+            {
+                ["sheet"] = ws.Name,
+                ["range"] = $"{CellRefFromIdx(r1, c1)}:{CellRefFromIdx(r2, c2)}",
+                ["applied"] = applied,
+            };
         }
 
         /// <summary>True when the given side of cell (r,c) is an edge INSIDE the range (both
@@ -821,8 +909,10 @@ namespace AIOrchestrator.API
         /// Detects the used column count from row 0.
         /// </summary>
         /// <param name="sheetName">Worksheet name (from GetSheetNames()).</param>
-        /// <returns>"true", or "Error: …" when the sheet is missing or the header row is empty.</returns>
-        public string FormatHeaderRow(string sheetName)
+        /// <returns>The style receipt — sheet, the formatted header range and the list of applied
+        /// parameters (feedback for the agent to verify its own work), or "Error: …" when the
+        /// sheet is missing or the header row is empty.</returns>
+        public object FormatHeaderRow(string sheetName)
         {
             var ws = FindSheet(sheetName);
             if (ws == null) return $"Error: worksheet '{sheetName}' not found";
@@ -851,7 +941,12 @@ namespace AIOrchestrator.API
             }
             Log.LogStep($"SpreadsheetTool.FormatHeaderRow: '{sheetName}' ({maxCol} columns)");
             _dirty = true;
-            return "true";
+            return new Dictionary<string, object?>
+            {
+                ["sheet"] = ws.Name,
+                ["range"] = $"{CellRefFromIdx(0, 0)}:{CellRefFromIdx(0, maxCol - 1)}",
+                ["applied"] = new object[] { "bold", "fontColor white", "fill #2278D4" },
+            };
         }
 
         // ──────────────────────────────────────────────
@@ -1516,8 +1611,10 @@ namespace AIOrchestrator.API
         /// <param name="printArea">Print area range (e.g. "A1:C10"). Null to keep current.</param>
         /// <param name="centerHorizontally">True to center horizontally on page.</param>
         /// <param name="centerVertically">True to center vertically on page.</param>
-        /// <returns>"true", or "Error: …" if settings were applied.</returns>
-        public string SetPageSetup(string sheetName,
+        /// <returns>The page-setup receipt — sheet and the list of settings actually applied
+        /// (feedback for the agent to verify its own work, e.g. that A4/fit-to-page really took
+        /// effect), or "Error: …" when the sheet is missing.</returns>
+        public object SetPageSetup(string sheetName,
             string? orientation = null, string? paperSize = null,
             int? scale = null, int? fitToPagesWide = null, int? fitToPagesTall = null,
             string? printArea = null, bool? centerHorizontally = null, bool? centerVertically = null)
@@ -1542,7 +1639,21 @@ namespace AIOrchestrator.API
 
             Log.LogStep($"SpreadsheetTool.SetPageSetup: '{sheetName}'");
             _dirty = true;
-            return "true";
+
+            var applied = new List<object>();
+            if (!string.IsNullOrEmpty(orientation)) applied.Add("orientation " + (ps.Orientation == PageOrientationType.Landscape ? "Landscape" : "Portrait"));
+            if (!string.IsNullOrEmpty(paperSize)) applied.Add("paperSize " + ps.PaperSize);
+            if (scale.HasValue) applied.Add("scale " + scale);
+            if (fitToPagesWide.HasValue) applied.Add("fitToPagesWide " + fitToPagesWide);
+            if (fitToPagesTall.HasValue) applied.Add("fitToPagesTall " + fitToPagesTall);
+            if (!string.IsNullOrEmpty(printArea)) applied.Add("printArea '" + printArea + "'");
+            if (centerHorizontally.HasValue) applied.Add("centerHorizontally " + centerHorizontally.Value.ToString().ToLowerInvariant());
+            if (centerVertically.HasValue) applied.Add("centerVertically " + centerVertically.Value.ToString().ToLowerInvariant());
+            return new Dictionary<string, object?>
+            {
+                ["sheet"] = ws.Name,
+                ["applied"] = applied,
+            };
         }
 
         /// <summary>
