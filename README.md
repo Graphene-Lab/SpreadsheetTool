@@ -40,6 +40,10 @@ Local pack pushes with the `NuGetApiKey` env var; skip with `-p:SkipNuGetPush=tr
 
 ## Notes
 
+- **Architecture**: see [ARCHITECTURE.md](ARCHITECTURE.md) for the internal design — the
+  **area-receipt** technique (every cell-writing method returns a compact snapshot of the
+  modified area as feedback for the agent) and the project rule that future
+  cell-writing methods must preserve it.
 - **Charts** are written as standard OOXML with the data embedded (series, categories
   and cached values), so they render in Excel, Office Online and other spreadsheet
   viewers without any recalculation. Known limitation: **LibreOffice** may render the
