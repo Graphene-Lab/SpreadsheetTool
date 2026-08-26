@@ -662,7 +662,8 @@ namespace AIOrchestrator.API
         /// <param name="horizontalAlignment">Horizontal: "Left","Center","Right".</param>
         /// <param name="verticalAlignment">Vertical: "Top","Center","Bottom".</param>
         /// <param name="wrapText">True = wrap text.</param>
-        /// <param name="numberFormat">Custom number format (e.g. "#,##0.00").</param>
+        /// <param name="numberFormat">Custom number format (e.g. "#,##0.00"). Pass it as a plain
+        /// string WITHOUT surrounding quotes — a quoted string is a literal in Excel format syntax.</param>
         /// <param name="borderStyle">Border line style (e.g. "Thin"). Only applied when set.</param>
         /// <param name="borderSide">Which sides to border (default "All").</param>
         /// <param name="borderColorHex">Border color "#RRGGBB" (default black).</param>
@@ -728,7 +729,7 @@ namespace AIOrchestrator.API
                     if (wrapText.HasValue)
                         style.WrapText = wrapText.Value;
                     if (!string.IsNullOrEmpty(numberFormat))
-                        style.Custom = numberFormat;
+                        style.Custom = NormalizeNumberFormat(numberFormat);
 
                     if (border.HasValue)
                     {
@@ -2585,6 +2586,23 @@ namespace AIOrchestrator.API
                 "distributed" => VerticalAlignmentType.Distributed,
                 _ => VerticalAlignmentType.Bottom,
             };
+        }
+
+        /// <summary>Normalizes an agent-supplied number format. Models often wrap the format in
+        /// quotes ("$#,##0.00") — a quoted string in Excel format syntax is a LITERAL, so those
+        /// quotes would make every cell display the format text instead of the value. The quotes
+        /// are stripped ONLY when the inner content looks like a format code (contains #, 0 or ?
+        /// placeholders); a legit quoted-literal format (e.g. "Total: "0.00) is preserved.</summary>
+        private static string NormalizeNumberFormat(string format)
+        {
+            var f = format.Trim();
+            if (f.Length >= 2 && f[0] == '"' && f[^1] == '"')
+            {
+                var inner = f[1..^1];
+                if (inner.Any(ch => ch is '#' or '0' or '?'))
+                    return inner;
+            }
+            return f;
         }
 
         private static BorderStyleType ParseBorderStyle(string value)

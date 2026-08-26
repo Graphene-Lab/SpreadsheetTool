@@ -412,7 +412,9 @@ static class Program
                 new[] { "2024", "13200", "9100", "=B4-C4" },
                 new[] { "2025", "11800", "7900", "=B5-C5" },
             });
-            ss.ApplyStyle("Sheet1", "B3:D5", numberFormat: "$#,##0.00");
+            // Currency format passed WITH surrounding quotes (as models often emit it): the tool
+            // must normalize it — a quoted string is a LITERAL in Excel format syntax.
+            ss.ApplyStyle("Sheet1", "B3:D5", numberFormat: "\"$#,##0.00\"");
             ss.FormatHeaderRow("Sheet1");          // blue on A1 — must NOT be overridden
             // Table 2: general title (A7), headers (row 8), numeric data.
             ss.SetCellValue("Sheet1", "A7", "Quarterly Targets");
@@ -451,8 +453,17 @@ static class Program
             if (!widths.TryGetValue(4, out var wD) || wD < 16) { ok = false; Console.WriteLine($"  ✗ col D expected ≥ 16, got {wD}"); }
             if (!widths.TryGetValue(5, out var wE) || Math.Abs(wE - 20) > 0.01) { ok = false; Console.WriteLine($"  ✗ col E expected 20 (user width preserved), got {wE}"); }
 
-            // 2) Title styling: fill color per cell, mapped through styles.xml.
+            // 3) Number format normalization: the quoted "$#,##0.00" must be saved WITHOUT quotes.
             var styles = ReadEntry(zip, "xl/styles.xml");
+            var formatCodes = new List<string>();
+            foreach (System.Text.RegularExpressions.Match m in System.Text.RegularExpressions.Regex.Matches(styles,
+                "<numFmt[^>]*formatCode=\"([^\"]*)\""))
+                formatCodes.Add(System.Net.WebUtility.HtmlDecode(m.Groups[1].Value));
+            Console.WriteLine($"  numFmt codes: {string.Join(" | ", formatCodes)}");
+            if (formatCodes.Any(fc => fc.Contains('"'))) { ok = false; Console.WriteLine("  ✗ a number format still contains literal quotes (would render as text)"); }
+            if (!formatCodes.Contains("$#,##0.00")) { ok = false; Console.WriteLine("  ✗ quoted \"$#,##0.00\" was not normalized to $#,##0.00"); }
+
+            // 2) Title styling: fill color per cell, mapped through styles.xml.
             var fillByStyle = ParseFillByStyle(styles);
             var cellFill = new Dictionary<string, string>();
             foreach (System.Text.RegularExpressions.Match m in System.Text.RegularExpressions.Regex.Matches(sheet,
