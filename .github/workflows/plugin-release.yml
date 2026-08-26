@@ -112,10 +112,13 @@ jobs:
           STAGE="/tmp/stage/$TOOL"
           mkdir -p "$STAGE"
           cp -r /tmp/nupkg/lib/net10.0/. "$STAGE/"
-          # Unique dependency dlls from the NuGet global cache.
+          # Unique dependency dlls from the NuGet global cache. `|| true` keeps the step alive
+          # when a "unique dep" is NOT a NuGet package (a ProjectReference appears in the
+          # restore graph with a runtime entry but has no cache folder — e.g. officecli for
+          # OfficeTool): such dlls already travel inside the plugin's own nupkg lib/.
           while IFS=$'\t' read -r pkg dll; do
             id="${pkg%%/*}"; ver="${pkg#*/}"
-            src=$(find "$HOME/.nuget/packages/${id,,}/$ver" -name "$dll" -path '*/lib/*' 2>/dev/null | head -n1)
+            src=$(find "$HOME/.nuget/packages/${id,,}/$ver" -name "$dll" -path '*/lib/*' 2>/dev/null | head -n1) || true
             if [ -n "$src" ]; then
               cp "$src" "$STAGE/"
             else
