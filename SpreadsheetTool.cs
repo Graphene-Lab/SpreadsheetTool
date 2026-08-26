@@ -1753,6 +1753,8 @@ namespace AIOrchestrator.API
         /// tables, charts, comments, merged cells, AutoFilter, and defined names.
         /// Formula patterns detect repeating formulas across ranges and report the pattern
         /// rather than listing every cell — e.g. "=B{r}*D{r}" applied to "C2:C100".
+        /// Use this method FIRST when you do not know the worksheet content, then zoom into
+        /// the areas of interest with GetRange(detailed=true).
         /// </summary>
         /// <param name="sheetName">
         /// Specific worksheet to describe (from GetSheetNames()), or null to describe all worksheets.
