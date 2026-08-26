@@ -373,9 +373,10 @@ static class Program
             {
                 using var sr = new StreamReader(sheetXml.Open());
                 var xml = sr.ReadToEnd();
-                var cols = System.Text.RegularExpressions.Regex.Matches(xml, "<col [^>]*width=\"([0-9.]+)\"");
-                Console.WriteLine($"sheet1 auto-fitted columns with width: {string.Join(", ", cols.Select(c => c.Groups[1].Value))}");
-                if (cols.Count == 0) { ok = false; Console.WriteLine("  ✗ no column widths written"); }
+                var bestFit = System.Text.RegularExpressions.Regex.Matches(xml, "<col [^>]*bestFit=\"1\"");
+                var widthCols = System.Text.RegularExpressions.Regex.Matches(xml, "<col [^>]*width=\"([0-9.]+)\"");
+                Console.WriteLine($"sheet1 bestFit columns: {bestFit.Count}, explicit-width columns: {widthCols.Count}");
+                if (bestFit.Count == 0) { ok = false; Console.WriteLine("  ✗ no bestFit columns written"); }
             }
         }
         Console.WriteLine(ok ? "\n✓ chart caches populated + series restructured + XML well-formed" : "\n✗ deterministic assists failed");
@@ -437,21 +438,27 @@ static class Program
         {
             var sheet = ReadEntry(zip, "xl/worksheets/sheet1.xml");
 
-            // 1) Column widths: default-width columns fitted, user width preserved.
-            var widths = new Dictionary<int, double>();
-            foreach (System.Text.RegularExpressions.Match m in System.Text.RegularExpressions.Regex.Matches(sheet,
-                "<col min=\"(\\d+)\" max=\"(\\d+)\" width=\"([0-9.]+)\""))
-            {
-                int min = int.Parse(m.Groups[1].Value), max = int.Parse(m.Groups[2].Value);
-                double w = double.Parse(m.Groups[3].Value, System.Globalization.CultureInfo.InvariantCulture);
-                for (int c = min; c <= max; c++) widths[c] = w;
-            }
-            Console.WriteLine($"  cols: {string.Join(", ", widths.Select(kv => $"{ColLetter(kv.Key)}={kv.Value}"))}");
-            // A: "Coffee Shop Report" (18) → ≥ 20 ; B: "$#,##0.00" → ≥ 13 ; D: formula+format → ≥ 16.
-            if (!widths.TryGetValue(1, out var wA) || wA < 20) { ok = false; Console.WriteLine($"  ✗ col A expected ≥ 20, got {wA}"); }
-            if (!widths.TryGetValue(2, out var wB) || wB < 13) { ok = false; Console.WriteLine($"  ✗ col B expected ≥ 13, got {wB}"); }
-            if (!widths.TryGetValue(4, out var wD) || wD < 16) { ok = false; Console.WriteLine($"  ✗ col D expected ≥ 16, got {wD}"); }
-            if (!widths.TryGetValue(5, out var wE) || Math.Abs(wE - 20) > 0.01) { ok = false; Console.WriteLine($"  ✗ col E expected 20 (user width preserved), got {wE}"); }
+            // 1) bestFit on the touched default-width columns (NO width value); the user-set
+            //    width on column E is preserved and must NOT get bestFit.
+            var colsSection = System.Text.RegularExpressions.Regex.Match(sheet, "<cols>.*?</cols>").Value;
+            Console.WriteLine($"  cols: {colsSection}");
+            var bestFitCols = new HashSet<int>();
+            foreach (System.Text.RegularExpressions.Match m in System.Text.RegularExpressions.Regex.Matches(colsSection,
+                "<col min=\"(\\d+)\"[^>]*bestFit=\"1\"[^>]*/>"))
+                bestFitCols.Add(int.Parse(m.Groups[1].Value));
+            var userWidths = new Dictionary<int, double>();
+            foreach (System.Text.RegularExpressions.Match m in System.Text.RegularExpressions.Regex.Matches(colsSection,
+                "<col min=\"(\\d+)\"[^>]*width=\"([0-9.]+)\""))
+                userWidths[int.Parse(m.Groups[1].Value)] = double.Parse(m.Groups[2].Value, System.Globalization.CultureInfo.InvariantCulture);
+
+            // A,B,C,D written by the agent with default width → bestFit, no width value.
+            foreach (var c in new[] { 1, 2, 3, 4 })
+                if (!bestFitCols.Contains(c)) { ok = false; Console.WriteLine($"  ✗ col {ColLetter(c)} expected bestFit"); }
+            if (userWidths.ContainsKey(1) || userWidths.ContainsKey(2) || userWidths.ContainsKey(3) || userWidths.ContainsKey(4))
+            { ok = false; Console.WriteLine("  ✗ a bestFit column must not carry a width value"); }
+            // E has a user-set width (20) → preserved, no bestFit.
+            if (!userWidths.TryGetValue(5, out var wE) || Math.Abs(wE - 20) > 0.01) { ok = false; Console.WriteLine($"  ✗ col E expected width 20 (user width preserved), got {wE}"); }
+            if (bestFitCols.Contains(5)) { ok = false; Console.WriteLine("  ✗ col E must NOT get bestFit (user width set)"); }
 
             // 3) Number format normalization: the quoted "$#,##0.00" must be saved WITHOUT quotes.
             var styles = ReadEntry(zip, "xl/styles.xml");

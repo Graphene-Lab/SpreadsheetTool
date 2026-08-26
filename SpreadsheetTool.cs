@@ -17,6 +17,16 @@ namespace AIOrchestrator.API
         /// skip the redundant second save when the agent already called Save explicitly.</summary>
         private bool _dirty;
 
+        /// <summary>Columns the agent wrote to or styled this session, per worksheet. Only these
+        /// get the bestFit flag at save: a column the USER set up (width or plain content) is
+        /// never touched unless the agent works on it.</summary>
+        private readonly Dictionary<string, HashSet<int>> _touchedCols = new();
+
+        /// <summary>Columns that will receive the OOXML bestFit flag (auto width computed by the
+        /// opening application) at save, per worksheet. Populated by the deterministic auto-format
+        /// pass right before persisting.</summary>
+        private readonly Dictionary<string, HashSet<int>> _bestFitCols = new();
+
         /// <summary>Guard for agent-supplied ranges: the tool must never let a huge range
         /// (e.g. "A1:XFD1048576") allocate unbounded memory or hang the session.</summary>
         private const int MaxCellArea = 1_000_000;
@@ -55,6 +65,8 @@ namespace AIOrchestrator.API
                 _workbook?.Dispose();
                 _filePath = SandboxPath.Resolve(filePath);
                 _workbook = new Workbook(_filePath);
+                _touchedCols.Clear();
+                _bestFitCols.Clear();
                 _dirty = false;
                 Log.LogStep($"SpreadsheetTool.Open: opened '{_filePath}'");
                 return "true";
@@ -84,6 +96,8 @@ namespace AIOrchestrator.API
                 var resolved = SandboxPath.Resolve(filePath);
                 _workbook?.Dispose();
                 _workbook = new Workbook();
+                _touchedCols.Clear();
+                _bestFitCols.Clear();
                 _workbook.Save(resolved);
                 _filePath = resolved;
                 _dirty = false;
@@ -257,6 +271,13 @@ namespace AIOrchestrator.API
             var ws = FindSheet(currentName);
             if (ws == null) return $"Error: worksheet '{currentName}' not found";
             if (FindSheet(newName) != null) return $"Error: worksheet '{newName}' already exists";
+            // Keep the per-sheet tracking with the renamed sheet.
+            foreach (var map in new[] { _touchedCols, _bestFitCols })
+                if (map.TryGetValue(currentName, out var set))
+                {
+                    map.Remove(currentName);
+                    map[newName] = set;
+                }
             ws.Name = newName;
             Log.LogStep($"SpreadsheetTool.RenameWorksheet: '{currentName}' → '{newName}'");
             _dirty = true;
@@ -395,6 +416,7 @@ namespace AIOrchestrator.API
             if (ws == null) return $"Error: worksheet '{sheetName}' not found";
             var p = TryParseCellRef(cellReference);
             if (!p.Ok) return $"Error: {p.Error}";
+            MarkColumnTouched(ws.Name, p.Col);
             SetCellValueAuto(ws.Cells[cellReference], value);
             _dirty = true;
             Log.LogStep($"SpreadsheetTool.SetCellValue: '{sheetName}'!{cellReference} = '{value}'");
@@ -433,6 +455,7 @@ namespace AIOrchestrator.API
             if (!p.Ok) return $"Error: {p.Error}";
             var cell = ws.Cells[cellReference];
             if (cell == null) return $"Error: cell '{cellReference}' not found";
+            MarkColumnTouched(ws.Name, p.Col);
             cell.Formula = formula;
             Log.LogStep($"SpreadsheetTool.SetCellFormula: '{sheetName}'!{cellReference} = {formula}");
             _dirty = true;
@@ -555,6 +578,9 @@ namespace AIOrchestrator.API
 
             var (startRow, startCol) = (p.Row, p.Col);
 
+            for (int c = 0; c < maxCols; c++)
+                MarkColumnTouched(ws.Name, startCol + c);
+
             for (int r = 0; r < values.Length; r++)
             {
                 if (values[r] == null) continue;
@@ -597,6 +623,9 @@ namespace AIOrchestrator.API
             if (maxCols == 0) return "Error: no values to append";
             if (area > MaxCellArea) return $"Error: the rows block is too large ({area} cells, max {MaxCellArea})";
             if (startRow + rows.Length > 1_048_576) return "Error: the rows block extends past the last row (1048576)";
+
+            for (int c = 0; c < maxCols; c++)
+                MarkColumnTouched(ws.Name, c);
 
             for (int r = 0; r < rows.Length; r++)
             {
@@ -683,6 +712,9 @@ namespace AIOrchestrator.API
             var p = TryParseRange(cellOrRange);
             if (!p.Ok) return $"Error: {p.Error}";
             var (r1, c1, r2, c2) = (p.R1, p.C1, p.R2, p.C2);
+
+            for (int c = c1; c <= c2; c++)
+                MarkColumnTouched(ws.Name, c);
 
             // Border parameters are resolved once, outside the cell loop. "Inside" borders only
             // the edges BETWEEN cells (outer perimeter excluded); "Outline" borders only the
@@ -809,6 +841,7 @@ namespace AIOrchestrator.API
             {
                 var cell = ws.Cells[0, c];
                 if (cell == null) continue;
+                MarkColumnTouched(ws.Name, c);
                 var style = cell.GetStyle();
                 style.Font.IsBold = true;
                 style.Font.Color = Color.FromArgb(255, 255, 255, 255);
@@ -1995,16 +2028,18 @@ namespace AIOrchestrator.API
         private void ApplyDeterministicAutoFormat()
         {
             if (_workbook == null) return;
+            _bestFitCols.Clear();
             foreach (var ws in _workbook.Worksheets)
-                ApplyDeterministicAutoFormatToSheet(ws);
+                ApplyDeterministicAutoFormatToSheet(ws, _touchedCols, _bestFitCols);
         }
 
-        private static void ApplyDeterministicAutoFormatToSheet(Worksheet ws)
+        private static void ApplyDeterministicAutoFormatToSheet(Worksheet ws,
+            Dictionary<string, HashSet<int>> touchedCols, Dictionary<string, HashSet<int>> bestFitCols)
         {
             int lastRow = FindLastUsedRow(ws);
             if (lastRow < 0) return;
 
-            // Phase 1 — per column: content-based width estimate and title runs.
+            // Phase 1 — per column: content scan + title runs.
             // runTop/runBottom: for every cell that is part of a title run, the run's first
             // and last row (bottom = the row directly above a data cell).
             var runTop = new Dictionary<(int Row, int Col), int>();
@@ -2012,7 +2047,6 @@ namespace AIOrchestrator.API
 
             for (int c = 0; c < 500; c++)
             {
-                double maxEstimate = 0;
                 bool hasContent = false;
                 var textSet = new HashSet<int>();
                 var dataRows = new List<int>();
@@ -2021,8 +2055,6 @@ namespace AIOrchestrator.API
                     var cell = ws.Cells[r, c];
                     if (cell == null || cell.Type == CellValueType.IsNull) continue;
                     hasContent = true;
-                    var est = EstimateCellWidth(cell);
-                    if (est > maxEstimate) maxEstimate = est;
                     if (!string.IsNullOrEmpty(cell.Formula) || cell.Type is CellValueType.IsNumeric
                         or CellValueType.IsDateTime or CellValueType.IsBool)
                         dataRows.Add(r);
@@ -2031,10 +2063,16 @@ namespace AIOrchestrator.API
                 }
                 if (!hasContent) continue;
 
-                // Auto width only when the column still has the default width (user-set widths stay).
-                var width = ws.Cells.Columns[c].Width;
-                if (width == null || Math.Abs(width.Value - DefaultColumnWidth) < 0.01)
-                    ws.Cells.Columns[c].Width = Math.Clamp(maxEstimate + 2.0, 8.0, 60.0);
+                // bestFit for columns the agent TOUCHED this session and that still carry the
+                // DEFAULT width: a width the user set is untouchable (the user is always right).
+                // The flag tells the opening application to auto-fit the column to its content
+                // (formulas included — the app computes the results, we cannot).
+                if (touchedCols.TryGetValue(ws.Name, out var touched) && touched.Contains(c))
+                {
+                    var width = ws.Cells.Columns[c].Width;
+                    if (width == null || Math.Abs(width.Value - DefaultColumnWidth) < 0.01)
+                        AddBestFitColumn(bestFitCols, ws.Name, c);
+                }
 
                 // Title runs: for each data cell, the contiguous text cells immediately above.
                 foreach (var dr in dataRows)
@@ -2091,16 +2129,118 @@ namespace AIOrchestrator.API
             }
         }
 
-        /// <summary>Display-width estimate for one cell: text = string length; numeric = raw
-        /// length, widened when a number format adds literals; formula = safe fixed width when
-        /// the column formats numbers, else the formula text length.</summary>
-        private static double EstimateCellWidth(Cell cell)
+        /// <summary>Records that the agent wrote to or styled a column this session — the marker
+        /// the auto-format pass uses to decide which columns get bestFit.</summary>
+        private void MarkColumnTouched(string sheetName, int col)
         {
-            var style = cell.GetStyle();
-            if (!string.IsNullOrEmpty(cell.Formula))
-                return !string.IsNullOrEmpty(style.Custom) ? 14.0 : cell.Formula.Length;
-            var raw = (cell.DisplayStringValue ?? "").Length;
-            return !string.IsNullOrEmpty(style.Custom) ? Math.Max(raw, style.Custom.Length + 2.0) : raw;
+            if (!_touchedCols.TryGetValue(sheetName, out var set))
+                _touchedCols[sheetName] = set = new HashSet<int>();
+            set.Add(col);
+        }
+
+        /// <summary>Adds a column to the bestFit set of a worksheet (populated at save time).</summary>
+        private static void AddBestFitColumn(Dictionary<string, HashSet<int>> bestFitCols, string sheetName, int col)
+        {
+            if (!bestFitCols.TryGetValue(sheetName, out var set))
+                bestFitCols[sheetName] = set = new HashSet<int>();
+            set.Add(col);
+        }
+
+        /// <summary>Injects the OOXML bestFit flag into the saved workbook: for every column the
+        /// agent touched with a default width, the <c>&lt;col&gt;</c> element is written WITHOUT a
+        /// width and with bestFit="1", so the OPENING APPLICATION auto-fits the column to its
+        /// rendered content (formula results included — the app computes them, we cannot). Columns
+        /// with a user-set width keep it untouched. Runs after save, on the temp package, exactly
+        /// like the chart-cache patch; the file is committed only if every part still parses.</summary>
+        private void InjectBestFit(string filePath)
+        {
+            if (_bestFitCols.Count == 0 || _workbook == null || !File.Exists(filePath)) return;
+            try
+            {
+                // Worksheet index → touched default-width columns (fork writes sheets in order).
+                var colsBySheet = new Dictionary<int, HashSet<int>>();
+                for (int i = 0; i < _workbook.Worksheets.Count; i++)
+                    if (_bestFitCols.TryGetValue(_workbook.Worksheets[i].Name, out var cols) && cols.Count > 0)
+                        colsBySheet[i] = cols;
+                if (colsBySheet.Count == 0) return;
+
+                // Same all-in-memory rewrite pattern as PatchChartCaches: read every entry,
+                // patch the targeted worksheet parts, write a fresh package and swap.
+                var entries = new List<(string Name, byte[] Data)>();
+                using (var zip = ZipFile.OpenRead(filePath))
+                    foreach (var e in zip.Entries)
+                    {
+                        using var ms = new MemoryStream();
+                        using (var s = e.Open()) s.CopyTo(ms);
+                        entries.Add((e.FullName, ms.ToArray()));
+                    }
+
+                var changed = false;
+                for (int i = 0; i < entries.Count; i++)
+                {
+                    var (name, data) = entries[i];
+                    var m = System.Text.RegularExpressions.Regex.Match(name, @"^xl/worksheets/sheet(\d+)\.xml$");
+                    if (!m.Success) continue;
+                    if (!colsBySheet.TryGetValue(int.Parse(m.Groups[1].Value) - 1, out var cols)) continue;
+                    var text = System.Text.Encoding.UTF8.GetString(data);
+                    var patched = InjectBestFitIntoSheetXml(text, cols);
+                    if (patched == text) continue;
+                    entries[i] = (name, System.Text.Encoding.UTF8.GetBytes(patched));
+                    changed = true;
+                }
+                if (!changed) return;
+
+                var tmp = filePath + ".tmp";
+                using (var outZip = ZipFile.Open(tmp, ZipArchiveMode.Create))
+                    foreach (var (name, data) in entries)
+                    {
+                        var entry = outZip.CreateEntry(name);
+                        using var s = entry.Open();
+                        s.Write(data, 0, data.Length);
+                    }
+                File.Delete(filePath);
+                File.Move(tmp, filePath);
+            }
+            catch (Exception ex)
+            {
+                Log.LogStep($"SpreadsheetTool.InjectBestFit: failed — {ex.Message}");
+            }
+        }
+
+        /// <summary>Rewrites the &lt;cols&gt; section of a worksheet part: keeps the existing (user
+        /// width) columns and adds a bestFit-only &lt;col&gt; for each touched default-width column,
+        /// sorted by min. Creates &lt;cols&gt; when absent (before &lt;sheetData&gt;).</summary>
+        private static string InjectBestFitIntoSheetXml(string xml, HashSet<int> cols)
+        {
+            var colsMatch = System.Text.RegularExpressions.Regex.Match(xml, "<cols>.*?</cols>");
+            var existing = new List<string>();
+            if (colsMatch.Success)
+            {
+                foreach (System.Text.RegularExpressions.Match m in System.Text.RegularExpressions.Regex.Matches(colsMatch.Value, "<col [^>]*/>"))
+                    existing.Add(m.Value);
+            }
+
+            var bestFit = cols.Select(c => $"<col min=\"{c + 1}\" max=\"{c + 1}\" bestFit=\"1\" />").ToList();
+            var all = existing.Concat(bestFit)
+                .Select(colXml =>
+                {
+                    var min = System.Text.RegularExpressions.Regex.Match(colXml, "min=\"(\\d+)\"").Groups[1].Value;
+                    return (Min: int.Parse(min), Xml: colXml);
+                })
+                .OrderBy(x => x.Min)
+                .Select(x => x.Xml)
+                .ToList();
+            var newCols = "<cols>" + string.Concat(all) + "</cols>";
+
+            if (colsMatch.Success)
+            {
+                var result = xml.Replace(colsMatch.Value, newCols);
+                return result == xml ? xml : result;
+            }
+            // No <cols> section: insert it right before <sheetData> (schema order).
+            var marker = "<sheetData>";
+            var idx = xml.IndexOf(marker, StringComparison.Ordinal);
+            return idx < 0 ? xml : xml.Insert(idx, newCols);
         }
 
         /// <summary>Writes the in-memory workbook to <paramref name="targetPath"/> through a temp
@@ -2114,6 +2254,7 @@ namespace AIOrchestrator.API
             {
                 _workbook!.Save(tmp);
                 PatchChartCaches(tmp);
+                InjectBestFit(tmp);
                 var validationError = ValidateXmlParts(tmp);
                 if (validationError != null)
                     return validationError;
