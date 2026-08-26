@@ -35,6 +35,12 @@ static class Program
         if (args.Contains("--charttest"))
             return RunChartTest();
 
+        // Deterministic auto-format check (no LLM): default-width columns are fitted, user-set
+        // widths preserved, and title cells (vertical runs above numbers/formulas) get a pastel
+        // fill + bold, one color per table, without overriding explicit styles.
+        if (args.Contains("--autofmt"))
+            return RunAutoFormatTest();
+
         // Provider selection: --provider <name> (default DeepSeekBridge). Key-based providers
         // (DeepSeek/Zai/Gemini) read credentials from the per-app setup.json or the debug
         // preset — see Setup.Load/LoadDebugPreset docs.
@@ -375,6 +381,133 @@ static class Program
         Console.WriteLine(ok ? "\n✓ chart caches populated + series restructured + XML well-formed" : "\n✗ deterministic assists failed");
         return ok ? 0 : 1;
     }
+
+    /// <summary>Deterministic auto-format check (--autofmt, no LLM): builds a workbook with two
+    /// tables (general title + column headers + numeric data + formulas + a number format), a
+    /// user-set column width and an explicitly styled header row; then verifies the saved XML:
+    /// default-width columns got fitted widths (format-aware), the user width is preserved, title
+    /// cells (vertical runs included) got a pastel fill + bold, the two tables got different
+    /// colors, and the FormatHeaderRow blue was not overridden.</summary>
+    static int RunAutoFormatTest()
+    {
+        Console.WriteLine("╔══════════════════════════════════════════════════╗");
+        Console.WriteLine("║  SpreadsheetTool deterministic auto-format check ║");
+        Console.WriteLine("╚══════════════════════════════════════════════════╝");
+        Log.IsEnabled = true;
+        var dir = Path.Combine(Path.GetTempPath(), "SpreadsheetAutoFmt_" + Guid.NewGuid().ToString("N")[..6]);
+        Directory.CreateDirectory(dir);
+        Setup.SkipIndexingOnStartup = true;
+        Setup.DocumentsPath = dir;
+
+        using (var ss = new SpreadsheetTool())
+        {
+            ss.Create("/autofmt.xlsx");
+            // Table 1: general title (A1), headers (row 2), numeric data (incl. Year in col A) +
+            // Profit formulas; currency format on B:D; FormatHeaderRow explicitly styles row 0.
+            ss.SetCellValue("Sheet1", "A1", "Coffee Shop Report");
+            ss.SetRange("Sheet1", "A2", new[]
+            {
+                new[] { "Year", "Revenue", "Costs", "Profit" },
+                new[] { "2023", "12500", "8400", "=B3-C3" },
+                new[] { "2024", "13200", "9100", "=B4-C4" },
+                new[] { "2025", "11800", "7900", "=B5-C5" },
+            });
+            ss.ApplyStyle("Sheet1", "B3:D5", numberFormat: "$#,##0.00");
+            ss.FormatHeaderRow("Sheet1");          // blue on A1 — must NOT be overridden
+            // Table 2: general title (A7), headers (row 8), numeric data.
+            ss.SetCellValue("Sheet1", "A7", "Quarterly Targets");
+            ss.SetRange("Sheet1", "A8", new[]
+            {
+                new[] { "Q1", "Q2" },
+                new[] { "100", "120" },
+                new[] { "110", "130" },
+            });
+            // User-set width on column E: must be preserved by the auto-format pass.
+            ss.SetColumnWidth("Sheet1", 4, 20);
+            ss.SetCellValue("Sheet1", "E2", "wide user column");
+            Console.WriteLine("  scenario: Create + SetRange + ApplyStyle + FormatHeaderRow + SetColumnWidth → Save");
+            Console.WriteLine($"  Save: {ss.Save()}");
+        }
+
+        var file = Path.Combine(dir, "autofmt.xlsx");
+        var ok = true;
+        using (var zip = System.IO.Compression.ZipFile.OpenRead(file))
+        {
+            var sheet = ReadEntry(zip, "xl/worksheets/sheet1.xml");
+
+            // 1) Column widths: default-width columns fitted, user width preserved.
+            var widths = new Dictionary<int, double>();
+            foreach (System.Text.RegularExpressions.Match m in System.Text.RegularExpressions.Regex.Matches(sheet,
+                "<col min=\"(\\d+)\" max=\"(\\d+)\" width=\"([0-9.]+)\""))
+            {
+                int min = int.Parse(m.Groups[1].Value), max = int.Parse(m.Groups[2].Value);
+                double w = double.Parse(m.Groups[3].Value, System.Globalization.CultureInfo.InvariantCulture);
+                for (int c = min; c <= max; c++) widths[c] = w;
+            }
+            Console.WriteLine($"  cols: {string.Join(", ", widths.Select(kv => $"{ColLetter(kv.Key)}={kv.Value}"))}");
+            // A: "Coffee Shop Report" (18) → ≥ 20 ; B: "$#,##0.00" → ≥ 13 ; D: formula+format → ≥ 16.
+            if (!widths.TryGetValue(1, out var wA) || wA < 20) { ok = false; Console.WriteLine($"  ✗ col A expected ≥ 20, got {wA}"); }
+            if (!widths.TryGetValue(2, out var wB) || wB < 13) { ok = false; Console.WriteLine($"  ✗ col B expected ≥ 13, got {wB}"); }
+            if (!widths.TryGetValue(4, out var wD) || wD < 16) { ok = false; Console.WriteLine($"  ✗ col D expected ≥ 16, got {wD}"); }
+            if (!widths.TryGetValue(5, out var wE) || Math.Abs(wE - 20) > 0.01) { ok = false; Console.WriteLine($"  ✗ col E expected 20 (user width preserved), got {wE}"); }
+
+            // 2) Title styling: fill color per cell, mapped through styles.xml.
+            var styles = ReadEntry(zip, "xl/styles.xml");
+            var fillByStyle = ParseFillByStyle(styles);
+            var cellFill = new Dictionary<string, string>();
+            foreach (System.Text.RegularExpressions.Match m in System.Text.RegularExpressions.Regex.Matches(sheet,
+                "<c r=\"([A-Z]+\\d+)\"(?:[^>]*?s=\"(\\d+)\")?"))
+            {
+                var refName = m.Groups[1].Value;
+                var styleIdx = m.Groups[2].Success ? int.Parse(m.Groups[2].Value) : 0;
+                cellFill[refName] = fillByStyle.TryGetValue(styleIdx, out var f) ? f : "(none)";
+            }
+            string F(string cell) => cellFill.TryGetValue(cell, out var f) ? f : "(none)";
+
+            Console.WriteLine($"  fills: A1={F("A1")} A2={F("A2")} A7={F("A7")} A8={F("A8")} A9={F("A9")} B8={F("B8")}");
+            if (!F("A1").Equals("FF2278D4", StringComparison.OrdinalIgnoreCase)) { ok = false; Console.WriteLine("  ✗ A1 (FormatHeaderRow blue) was overridden"); }
+            if (F("A2") == "(none)" || F("A2") == "FF2278D4") { ok = false; Console.WriteLine("  ✗ A2 title not pastel-styled"); }
+            if (F("A7") != F("A8")) { ok = false; Console.WriteLine("  ✗ A7 general title must share the table-2 color with A8"); }
+            if (F("A2") == F("A7")) { ok = false; Console.WriteLine("  ✗ table 1 and table 2 must get different colors"); }
+            if (F("A9") != "(none)") { ok = false; Console.WriteLine($"  ✗ A9 (data) must not be styled, got {F("A9")}"); }
+            if (F("B8") != F("A8")) { ok = false; Console.WriteLine("  ✗ B8 header must share the table-2 color"); }
+        }
+        Console.WriteLine(ok ? "\n✓ auto-format deterministic checks passed" : "\n✗ auto-format deterministic checks failed");
+        return ok ? 0 : 1;
+    }
+
+    static string ReadEntry(System.IO.Compression.ZipArchive zip, string name)
+    {
+        var entry = zip.GetEntry(name);
+        if (entry == null) return "";
+        using var sr = new StreamReader(entry.Open());
+        return sr.ReadToEnd();
+    }
+
+    /// <summary>Maps a cellXfs style index to its fill color rgb (or "(none)"). Parses the
+    /// fills list and the cellXfs fillId references from styles.xml.</summary>
+    static Dictionary<int, string> ParseFillByStyle(string stylesXml)
+    {
+        var fills = new List<string>();
+        foreach (System.Text.RegularExpressions.Match fm in System.Text.RegularExpressions.Regex.Matches(stylesXml, "<fill>(.*?)</fill>"))
+        {
+            var rgb = System.Text.RegularExpressions.Regex.Match(fm.Groups[1].Value, "fgColor rgb=\"([0-9A-Fa-f]{8})\"");
+            fills.Add(rgb.Success ? rgb.Groups[1].Value.ToUpperInvariant() : "(none)");
+        }
+        var result = new Dictionary<int, string>();
+        var xfs = System.Text.RegularExpressions.Regex.Match(stylesXml, "<cellXfs[^>]*>(.*?)</cellXfs>", System.Text.RegularExpressions.RegexOptions.Singleline);
+        if (!xfs.Success) return result;
+        int idx = 0;
+        foreach (System.Text.RegularExpressions.Match x in System.Text.RegularExpressions.Regex.Matches(xfs.Groups[1].Value, "<xf[^>]*>"))
+        {
+            var fillId = System.Text.RegularExpressions.Regex.Match(x.Value, "fillId=\"(\\d+)\"").Groups[1].Value;
+            var f = int.TryParse(fillId, out var fi) && fi < fills.Count ? fills[fi] : "(none)";
+            result[idx++] = f;
+        }
+        return result;
+    }
+
+    static string ColLetter(int col) => col >= 1 && col <= 26 ? ((char)('A' + col - 1)).ToString() : "?";
 
     /// <summary>Verifies the method surface the LLM is given: GetToolDefinitions must
     /// contain every method the scenario relies on. No LLM involved — this proves whether

@@ -17,11 +17,6 @@ namespace AIOrchestrator.API
         /// skip the redundant second save when the agent already called Save explicitly.</summary>
         private bool _dirty;
 
-        /// <summary>Columns whose width was already auto-set in this session, per worksheet.
-        /// First use of a fresh column gets an auto width; later edits keep it (deterministic
-        /// assist — the agent should not have to estimate column widths).</summary>
-        private readonly Dictionary<string, HashSet<int>> _autoWidthCols = new();
-
         /// <summary>Guard for agent-supplied ranges: the tool must never let a huge range
         /// (e.g. "A1:XFD1048576") allocate unbounded memory or hang the session.</summary>
         private const int MaxCellArea = 1_000_000;
@@ -60,11 +55,6 @@ namespace AIOrchestrator.API
                 _workbook?.Dispose();
                 _filePath = SandboxPath.Resolve(filePath);
                 _workbook = new Workbook(_filePath);
-                // Columns that already carry content keep their width on later edits: record
-                // them so the first-write auto width does not override an existing layout.
-                _autoWidthCols.Clear();
-                foreach (var ws in _workbook.Worksheets)
-                    _autoWidthCols[ws.Name] = ScanNonEmptyColumns(ws);
                 _dirty = false;
                 Log.LogStep($"SpreadsheetTool.Open: opened '{_filePath}'");
                 return "true";
@@ -94,12 +84,11 @@ namespace AIOrchestrator.API
                 var resolved = SandboxPath.Resolve(filePath);
                 _workbook?.Dispose();
                 _workbook = new Workbook();
-                _autoWidthCols.Clear();
                 _workbook.Save(resolved);
                 _filePath = resolved;
                 _dirty = false;
                 Log.LogStep($"SpreadsheetTool.Create: created '{resolved}'");
-                return "true";
+                return $"Workbook created at '{SandboxPath.ToAgent(resolved)}'.";
             }
             catch (Exception ex)
             {
@@ -122,6 +111,7 @@ namespace AIOrchestrator.API
             if (_workbook == null) return "No changes to save — no workbook is open.";
             if (!_dirty) return "No changes to save — the workbook is unchanged since the last save.";
 
+            ApplyDeterministicAutoFormat();
             var validationError = PersistValidated(_filePath);
             if (validationError != null)
             {
@@ -132,9 +122,10 @@ namespace AIOrchestrator.API
             var versionId = GitSupport.Snapshot(_filePath, "SpreadsheetTool save");
             _dirty = false;
             Log.LogStep($"SpreadsheetTool.Save: saved to '{_filePath}', version='{versionId}'");
+            var agentPath = SandboxPath.ToAgent(_filePath);
             return versionId != null
-                ? $"Workbook saved to '{Path.GetFileName(_filePath)}'. New version: {versionId}. (Rollback via GitTool.restore.)"
-                : $"Workbook saved to '{Path.GetFileName(_filePath)}'. (No changes detected.)";
+                ? $"Workbook saved to '{agentPath}'. New version: {versionId}. (Rollback via GitTool.restore.)"
+                : $"Workbook saved to '{agentPath}'. (No changes detected.)";
         }
 
         /// <summary>
@@ -150,6 +141,7 @@ namespace AIOrchestrator.API
             if (_workbook == null) return "No changes to save — no workbook is open.";
 
             var resolved = SandboxPath.Resolve(newFilePath);
+            ApplyDeterministicAutoFormat();
             var validationError = PersistValidated(resolved);
             if (validationError != null)
             {
@@ -161,9 +153,10 @@ namespace AIOrchestrator.API
             var versionId = GitSupport.Snapshot(_filePath, "SpreadsheetTool save as");
             _dirty = false;
             Log.LogStep($"SpreadsheetTool.SaveAs: saved to '{_filePath}', version='{versionId}'");
+            var agentPath = SandboxPath.ToAgent(resolved);
             return versionId != null
-                ? $"Workbook saved as '{Path.GetFileName(resolved)}'. New version: {versionId}."
-                : $"Workbook saved as '{Path.GetFileName(resolved)}'.";
+                ? $"Workbook saved as '{agentPath}'. New version: {versionId}."
+                : $"Workbook saved as '{agentPath}'.";
         }
 
         /// <summary>Reverts the OPEN workbook to a version from the workspace git repo (list them with
@@ -207,6 +200,7 @@ namespace AIOrchestrator.API
             {
                 if (_workbook != null && !string.IsNullOrEmpty(_filePath) && _dirty)
                 {
+                    ApplyDeterministicAutoFormat();
                     var validationError = PersistValidated(_filePath);
                     if (validationError != null)
                     {
@@ -263,12 +257,6 @@ namespace AIOrchestrator.API
             var ws = FindSheet(currentName);
             if (ws == null) return $"Error: worksheet '{currentName}' not found";
             if (FindSheet(newName) != null) return $"Error: worksheet '{newName}' already exists";
-            // Keep the auto-width state with the sheet: the fresh-column cache is keyed by name.
-            if (_autoWidthCols.TryGetValue(currentName, out var set))
-            {
-                _autoWidthCols.Remove(currentName);
-                _autoWidthCols[newName] = set;
-            }
             ws.Name = newName;
             Log.LogStep($"SpreadsheetTool.RenameWorksheet: '{currentName}' → '{newName}'");
             _dirty = true;
@@ -407,9 +395,7 @@ namespace AIOrchestrator.API
             if (ws == null) return $"Error: worksheet '{sheetName}' not found";
             var p = TryParseCellRef(cellReference);
             if (!p.Ok) return $"Error: {p.Error}";
-            var fresh = IsFreshColumn(ws, p.Col);
             SetCellValueAuto(ws.Cells[cellReference], value);
-            if (fresh) ApplyAutoWidth(ws, p.Col, new[] { value }); // first write to a fresh column → auto width
             _dirty = true;
             Log.LogStep($"SpreadsheetTool.SetCellValue: '{sheetName}'!{cellReference} = '{value}'");
             return "true";
@@ -447,9 +433,7 @@ namespace AIOrchestrator.API
             if (!p.Ok) return $"Error: {p.Error}";
             var cell = ws.Cells[cellReference];
             if (cell == null) return $"Error: cell '{cellReference}' not found";
-            var fresh = IsFreshColumn(ws, p.Col);
             cell.Formula = formula;
-            if (fresh) ApplyAutoWidth(ws, p.Col, new[] { formula });
             Log.LogStep($"SpreadsheetTool.SetCellFormula: '{sheetName}'!{cellReference} = {formula}");
             _dirty = true;
             return "true";
@@ -571,20 +555,6 @@ namespace AIOrchestrator.API
 
             var (startRow, startCol) = (p.Row, p.Col);
 
-            // Fresh columns (first use in this session, no prior content) get an auto width.
-            // Scan across ALL rows, not just the first: a row wider than row 0 must still
-            // auto-fit its extra columns.
-            var freshCols = new List<(int Col, List<string> Written)>();
-            for (int c = 0; c < maxCols; c++)
-            {
-                if (!IsFreshColumn(ws, startCol + c)) continue;
-                var written = new List<string>();
-                for (int r = 0; r < values.Length; r++)
-                    if (values[r] != null && c < values[r].Length)
-                        written.Add(values[r][c]);
-                freshCols.Add((startCol + c, written));
-            }
-
             for (int r = 0; r < values.Length; r++)
             {
                 if (values[r] == null) continue;
@@ -595,9 +565,6 @@ namespace AIOrchestrator.API
                         SetCellValueAuto(cell, values[r][c]);
                 }
             }
-
-            foreach (var (col, written) in freshCols)
-                ApplyAutoWidth(ws, col, written);
 
             _dirty = true;
             Log.LogStep($"SpreadsheetTool.SetRange: '{sheetName}'!{startCell} ({values.Length} rows)");
@@ -631,19 +598,6 @@ namespace AIOrchestrator.API
             if (area > MaxCellArea) return $"Error: the rows block is too large ({area} cells, max {MaxCellArea})";
             if (startRow + rows.Length > 1_048_576) return "Error: the rows block extends past the last row (1048576)";
 
-            // Auto width for columns that had no content before this append. Scan across ALL
-            // rows: a row wider than row 0 must still auto-fit its extra columns.
-            var freshCols = new List<(int Col, List<string> Written)>();
-            for (int c = 0; c < maxCols; c++)
-            {
-                if (!IsFreshColumn(ws, c)) continue;
-                var written = new List<string>();
-                for (int r = 0; r < rows.Length; r++)
-                    if (rows[r] != null && c < rows[r].Length)
-                        written.Add(rows[r][c]);
-                freshCols.Add((c, written));
-            }
-
             for (int r = 0; r < rows.Length; r++)
             {
                 if (rows[r] == null) continue;
@@ -654,9 +608,6 @@ namespace AIOrchestrator.API
                         SetCellValueAuto(cell, rows[r][c]);
                 }
             }
-
-            foreach (var (col, written) in freshCols)
-                ApplyAutoWidth(ws, col, written);
 
             _dirty = true;
             Log.LogStep($"SpreadsheetTool.AppendRows: '{sheetName}' ({rows.Length} rows from row {startRow})");
@@ -1044,6 +995,10 @@ namespace AIOrchestrator.API
             var sheet = bang >= 0 ? r[..bang].Trim() : defaultSheet;
             var cells = bang >= 0 ? r[(bang + 1)..].Trim() : r.Trim('$').Trim();
             cells = cells.Replace("$", "");
+            // Accept a sheet name the caller already quoted ("'Monthly Data'!A1:C7" — valid Excel
+            // syntax) instead of double-quoting it below, which produces "''Monthly Data''!A1:C7".
+            if (sheet.Length >= 2 && sheet[0] == '\'' && sheet[^1] == '\'')
+                sheet = sheet[1..^1].Trim();
             // Quote sheet names containing characters that break the range syntax.
             if (sheet.Any(ch => !char.IsLetterOrDigit(ch) && ch != '_'))
                 sheet = "'" + sheet + "'";
@@ -2004,45 +1959,147 @@ namespace AIOrchestrator.API
             return sb.ToString();
         }
 
-        /// <summary>True the first time this session writes to a column (a "fresh" column that
-        /// had no prior content). Later writes keep the width that was already set.</summary>
-        private bool IsFreshColumn(Worksheet ws, int col)
+        // ──────────────────────────────────────────────
+        //  Deterministic auto-format (save-time pass)
+        // ──────────────────────────────────────────────
+
+        /// <summary>Pastel palette for table titles, rotated per detected table. Light enough to
+        /// keep the default dark font readable.</summary>
+        private static readonly Color[] TitlePalette =
         {
-            if (!_autoWidthCols.TryGetValue(ws.Name, out var set))
-            {
-                set = new HashSet<int>();
-                _autoWidthCols[ws.Name] = set;
-            }
-            return set.Add(col);
+            Color.FromArgb(255, 221, 235, 247),   // light blue
+            Color.FromArgb(255, 226, 239, 218),   // light green
+            Color.FromArgb(255, 252, 228, 214),   // light orange
+            Color.FromArgb(255, 228, 223, 236),   // light purple
+            Color.FromArgb(255, 255, 242, 204),   // light yellow
+            Color.FromArgb(255, 217, 226, 243),   // light steel
+        };
+
+        /// <summary>Default column width (chars) used when no width is set; a column at this
+        /// width (or unset) is auto-fitted at save. Explicitly user-set widths are preserved.</summary>
+        private const double DefaultColumnWidth = 8.43;
+
+        /// <summary>
+        /// Deterministic, agent-invisible formatting applied at every persist:
+        ///   • columns that still carry the DEFAULT width are auto-fitted to their content
+        ///     (format-aware: numbers with a number format and formula cells get a safe width,
+        ///     so formatted values never render as "###"); columns explicitly adjusted by the
+        ///     user/agent are left untouched;
+        ///   • text cells forming a contiguous vertical run directly above a number/formula
+        ///     cell are styled as table titles (bold + light pastel background, one palette
+        ///     color per table) — "general title → column header → data" is all styled, in
+        ///     any write order. Cells already styled by the user/agent are never overridden.
+        /// Idempotent: styled/fitted once, skipped afterwards.
+        /// </summary>
+        private void ApplyDeterministicAutoFormat()
+        {
+            if (_workbook == null) return;
+            foreach (var ws in _workbook.Worksheets)
+                ApplyDeterministicAutoFormatToSheet(ws);
         }
 
-        /// <summary>Finds every column that already carries content (used when opening a file,
-        /// so auto width never overrides an existing column layout).</summary>
-        private static HashSet<int> ScanNonEmptyColumns(Worksheet ws)
+        private static void ApplyDeterministicAutoFormatToSheet(Worksheet ws)
         {
-            var cols = new HashSet<int>();
-            int lastUsedRow = -1;
-            for (int r = 0; r < 5000; r++)
+            int lastRow = FindLastUsedRow(ws);
+            if (lastRow < 0) return;
+
+            // Phase 1 — per column: content-based width estimate and title runs.
+            // runTop/runBottom: for every cell that is part of a title run, the run's first
+            // and last row (bottom = the row directly above a data cell).
+            var runTop = new Dictionary<(int Row, int Col), int>();
+            var runBottom = new Dictionary<(int Row, int Col), int>();
+
+            for (int c = 0; c < 500; c++)
             {
-                bool any = false;
-                for (int c = 0; c < 500; c++)
+                double maxEstimate = 0;
+                bool hasContent = false;
+                var textSet = new HashSet<int>();
+                var dataRows = new List<int>();
+                for (int r = 0; r <= lastRow; r++)
                 {
                     var cell = ws.Cells[r, c];
-                    if (cell != null && (!string.IsNullOrEmpty(cell.DisplayStringValue) || !string.IsNullOrEmpty(cell.Formula)))
-                    { cols.Add(c); any = true; }
+                    if (cell == null || cell.Type == CellValueType.IsNull) continue;
+                    hasContent = true;
+                    var est = EstimateCellWidth(cell);
+                    if (est > maxEstimate) maxEstimate = est;
+                    if (!string.IsNullOrEmpty(cell.Formula) || cell.Type is CellValueType.IsNumeric
+                        or CellValueType.IsDateTime or CellValueType.IsBool)
+                        dataRows.Add(r);
+                    else if (cell.Type == CellValueType.IsString && !string.IsNullOrEmpty(cell.DisplayStringValue))
+                        textSet.Add(r);
                 }
-                if (any) lastUsedRow = r;
-                else if (r > lastUsedRow + 5) break; // 5 empty rows → stop
+                if (!hasContent) continue;
+
+                // Auto width only when the column still has the default width (user-set widths stay).
+                var width = ws.Cells.Columns[c].Width;
+                if (width == null || Math.Abs(width.Value - DefaultColumnWidth) < 0.01)
+                    ws.Cells.Columns[c].Width = Math.Clamp(maxEstimate + 2.0, 8.0, 60.0);
+
+                // Title runs: for each data cell, the contiguous text cells immediately above.
+                foreach (var dr in dataRows)
+                {
+                    int top = dr - 1;
+                    while (top >= 0 && textSet.Contains(top)) top--;
+                    int bottom = dr - 1;
+                    if (top >= bottom) continue;   // no text run above this data cell
+                    for (int r = top + 1; r <= bottom; r++)
+                    {
+                        runTop[(r, c)] = top + 1;
+                        runBottom[(r, c)] = bottom;
+                    }
+                }
             }
-            return cols;
+
+            if (runBottom.Count == 0) return;
+
+            // Phase 2 — table grouping: a table's title row = maximal horizontal run of cells
+            // that are the BOTTOM of their vertical run (data directly below). Each table gets
+            // the next palette color; the cells above in the run inherit it.
+            var titleColor = new Dictionary<(int Row, int Col), Color>();
+            int tableIdx = 0;
+            for (int r = 0; r <= lastRow; r++)
+            {
+                int c = 0;
+                while (c < 500)
+                {
+                    bool isBottom = runBottom.TryGetValue((r, c), out var b) && b == r;
+                    if (!isBottom) { c++; continue; }
+                    int start = c;
+                    while (c < 500 && runBottom.TryGetValue((r, c), out var b2) && b2 == r) c++;
+                    var color = TitlePalette[tableIdx++ % TitlePalette.Length];
+                    for (int cc = start; cc < c; cc++)
+                    {
+                        var top = runTop[(r, cc)];
+                        for (int rr = top; rr <= r; rr++)
+                            titleColor[(rr, cc)] = color;
+                    }
+                }
+            }
+
+            // Phase 3 — apply the style, skipping cells the user/agent already styled.
+            foreach (var ((r, c), color) in titleColor)
+            {
+                var cell = ws.Cells[r, c];
+                if (cell == null) continue;
+                var style = cell.GetStyle();
+                if (style.Pattern != FillPattern.None || style.Font.IsBold) continue;
+                style.Font.IsBold = true;
+                style.Pattern = FillPattern.Solid;
+                style.ForegroundColor = color;
+                cell.SetStyle(style);
+            }
         }
 
-        /// <summary>Content-based column width (the FOSS fork has no AutoFit API): the longest
-        /// written value plus padding, bounded to a sane range.</summary>
-        private static void ApplyAutoWidth(Worksheet ws, int col, IEnumerable<string> writtenValues)
+        /// <summary>Display-width estimate for one cell: text = string length; numeric = raw
+        /// length, widened when a number format adds literals; formula = safe fixed width when
+        /// the column formats numbers, else the formula text length.</summary>
+        private static double EstimateCellWidth(Cell cell)
         {
-            var maxLen = writtenValues.Where(v => !string.IsNullOrEmpty(v)).Select(v => v.Length).DefaultIfEmpty(0).Max();
-            ws.Cells.Columns[col].Width = Math.Clamp(maxLen + 2.0, 8.0, 60.0);
+            var style = cell.GetStyle();
+            if (!string.IsNullOrEmpty(cell.Formula))
+                return !string.IsNullOrEmpty(style.Custom) ? 14.0 : cell.Formula.Length;
+            var raw = (cell.DisplayStringValue ?? "").Length;
+            return !string.IsNullOrEmpty(style.Custom) ? Math.Max(raw, style.Custom.Length + 2.0) : raw;
         }
 
         /// <summary>Writes the in-memory workbook to <paramref name="targetPath"/> through a temp
