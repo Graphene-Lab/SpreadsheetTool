@@ -1766,7 +1766,7 @@ namespace AIOrchestrator.API
         public string DescribeWorksheet(string? sheetName = null, int sampleRowCount = 5)
         {
             if (_workbook == null)
-                return "{\"error\": \"No workbook loaded. Call Open(filePath) first.\"}";
+                return $"{{\"error\": \"No workbook loaded. Call {AIOrchestrator.Utility.ToSnakeCase(nameof(Open))}(filePath) first.\"}}";
 
             sampleRowCount = Math.Clamp(sampleRowCount, 1, 20);
 
