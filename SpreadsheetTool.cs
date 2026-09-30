@@ -6,7 +6,7 @@ using System.IO.Compression;
 namespace AIOrchestrator.API
 {
     /// <summary>
-    /// Spreadsheet (XLSX) operations for agent use: open/create, cells, ranges, styles, charts, tables.
+    /// Edit Excel spreadsheets (.xlsx): cells, formulas, ranges, styles, charts and tables.
     /// </summary>
     public class SpreadsheetTool : BaseAgentTool, IDisposable, IFileTool
     {
