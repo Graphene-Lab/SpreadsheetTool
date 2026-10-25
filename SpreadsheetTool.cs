@@ -8,6 +8,7 @@ namespace AIOrchestrator.API
     /// <summary>
     /// Edit Excel spreadsheets (.xlsx): cells, formulas, ranges, styles, charts and tables.
     /// </summary>
+    [ToolPurpose(ToolPurpose.Spreadsheets)]
     public class SpreadsheetTool : BaseAgentTool, IDisposable, IFileTool
     {
         private Workbook? _workbook;
