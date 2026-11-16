@@ -34,8 +34,10 @@ from it.
 
 ## NuGet
 
-`Graphene.SpreadsheetTool`, date-versioned `1.yy.MM.dd`, published automatically on
-every `master` push (`.github/workflows/publish.yml`, `NUGET_API_KEY` repo secret).
+`Graphene.SpreadsheetTool`, date-versioned `1.yy.MM.dd`, published by
+`.github/workflows/publish.yml` when a `v*` tag is pushed. No secret is involved: the workflow mints
+a short-lived credential through trusted publishing (`NuGet/login@v1` plus
+`permissions: id-token: write`), so a plain `master` push publishes nothing.
 Local pack pushes with the `NuGetApiKey` env var; skip with `-p:SkipNuGetPush=true`.
 
 ## Notes
