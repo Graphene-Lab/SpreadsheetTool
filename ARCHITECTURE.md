@@ -6,9 +6,9 @@ consistent for future methods.
 
 ## Overview
 
-SpreadsheetTool is a plugin (implements `AIOrchestrator.API.IAgentTool`) that exposes
+SpreadsheetTool is a plugin (derives from `AIOrchestrator.API.BaseAgentTool`) that exposes
 spreadsheet operations to LLM agents. The public methods become LLM-callable tools via
-the `GeToolDefinitions` reflection pipeline, which reads the XML documentation file.
+the `GetToolDefinitions` reflection pipeline, which reads the XML documentation file.
 
 The implementation is built on the **Aspose.Cells_FOSS** fork (MIT). The fork has no
 calculation engine, no auto-fit API and no rendering: everything the agent needs that
